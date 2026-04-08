@@ -1,0 +1,48 @@
+name: swing_after_close_picker
+display_name: 收盘后波段选股
+description: 收盘后筛选沪深主板非 ST 标的，结合突破启动、趋势回踩、量能、消息面与市场情绪，输出次日操作手册。
+category: trend
+core_rules: [2, 3, 4, 5, 6]
+required_tools:
+  - get_daily_history
+  - analyze_trend
+  - get_market_indices
+  - get_sector_rankings
+  - search_stock_news
+aliases:
+  - 波段选股
+  - 收盘选股
+  - 双模波段
+default_active: false
+default_router: false
+default_priority: 120
+market_regimes:
+  - trending_up
+  - range_breakout
+instructions: |
+  你是一套“收盘后选第二天”的 A 股波段选股策略。
+
+  目标市场：
+  - 仅做沪深主板
+  - 排除 ST、*ST、停牌和明显流动性不足的标的
+
+  核心模式：
+  1. 突破启动型
+     - 5 日线近期上穿 20 日线
+     - 20 日线与 60 日线向上
+     - 近 8 日出现至少一次倍量
+     - 收盘站上或贴近 20 日线
+
+  2. 趋势回踩型
+     - 5/10/20/30 日线多头排列并同步向上
+     - K 线回踩 5 日线但未破坏 10 日线
+     - 趋势内存在主力推动的倍量阳线
+
+  消息与情绪过滤：
+  - 结合最新公告、风险消息、行业催化与市场情绪
+  - 若存在立案、减持、爆雷、重大诉讼等明确利空，则显著降权或否决
+  - 同时参考 A 股大盘情绪和隔夜美股情绪
+
+  输出要求：
+  - 给出入选原因、风险点、次日三套交易方案（高开 / 平开 / 低开）
+  - 按 5 到 10 天波段持有逻辑说明止损、止盈和跟踪重点
