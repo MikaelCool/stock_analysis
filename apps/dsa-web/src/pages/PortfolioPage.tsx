@@ -399,6 +399,25 @@ const PortfolioPage: React.FC = () => {
   }, [loadSnapshotAndRisk]);
 
   useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (document.hidden) return;
+      void loadSnapshotAndRisk();
+    }, 60000);
+
+    const onVisibilityChange = () => {
+      if (!document.hidden) {
+        void loadSnapshotAndRisk();
+      }
+    };
+
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [loadSnapshotAndRisk]);
+
+  useEffect(() => {
     void loadEvents();
   }, [loadEvents]);
 

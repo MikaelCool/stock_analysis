@@ -111,7 +111,9 @@ export const stockPickerApi = {
     return toCamel<PickerRun>(response.data);
   },
   async getMarketSentiment(): Promise<PickerMarketSentiment> {
-    const response = await apiClient.get('/api/v1/picker/market-sentiment');
+    const response = await apiClient.get('/api/v1/picker/market-sentiment', {
+      params: { _t: Date.now() },
+    });
     return toCamel<PickerMarketSentiment>(response.data);
   },
   async scan(payload: PickerScanRequest): Promise<PickerRun> {

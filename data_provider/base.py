@@ -1252,7 +1252,7 @@ class DataFetcherManager:
             logger.error(f"[预取] 批量预取异常: {e}")
             return 0
     
-    def get_realtime_quote(self, stock_code: str, *, log_final_failure: bool = True):
+    def get_realtime_quote(self, stock_code: str, *, log_final_failure: bool = True, force_refresh: bool = False):
         """
         获取实时行情数据（自动故障切换）
         
@@ -1290,16 +1290,17 @@ class DataFetcherManager:
             return None
 
         cache_key = self._make_cache_key("realtime", market, stock_code)
-        cached_quote_payload = self._read_snapshot_cache("realtime", cache_key, market=market)
-        if cached_quote_payload and isinstance(cached_quote_payload.get("quote"), dict):
-            try:
-                payload = dict(cached_quote_payload["quote"])
-                source_value = str(payload.pop("source", "fallback"))
-                payload["source"] = RealtimeSource(source_value)
-                logger.info(f"[本地缓存] {stock_code} 实时行情命中")
-                return UnifiedRealtimeQuote(**payload)
-            except Exception as exc:
-                logger.debug(f"[本地缓存] {stock_code} 实时行情反序列化失败: {exc}")
+        if not force_refresh:
+            cached_quote_payload = self._read_snapshot_cache("realtime", cache_key, market=market)
+            if cached_quote_payload and isinstance(cached_quote_payload.get("quote"), dict):
+                try:
+                    payload = dict(cached_quote_payload["quote"])
+                    source_value = str(payload.pop("source", "fallback"))
+                    payload["source"] = RealtimeSource(source_value)
+                    logger.info(f"[本地缓存] {stock_code} 实时行情命中")
+                    return UnifiedRealtimeQuote(**payload)
+                except Exception as exc:
+                    logger.debug(f"[本地缓存] {stock_code} 实时行情反序列化失败: {exc}")
 
         # ----------------------------------------------------------
         # 美股 (指数 + 个股) / 港股 — 专用双源路由
@@ -1784,13 +1785,14 @@ class DataFetcherManager:
         logger.info(f"[股票名称] 批量获取完成，成功 {len(result)}/{len(stock_codes)}")
         return result
 
-    def get_main_indices(self, region: str = "cn") -> List[Dict[str, Any]]:
+    def get_main_indices(self, region: str = "cn", *, use_cache: bool = True) -> List[Dict[str, Any]]:
         """获取主要指数实时行情（自动切换数据源）"""
         cache_key = self._make_cache_key("indices", region)
-        cached_payload = self._read_snapshot_cache("indices", cache_key, market=region)
-        if cached_payload and isinstance(cached_payload.get("data"), list):
-            logger.info(f"[本地缓存] {region} 指数行情命中")
-            return cached_payload["data"]
+        if use_cache:
+            cached_payload = self._read_snapshot_cache("indices", cache_key, market=region)
+            if cached_payload and isinstance(cached_payload.get("data"), list):
+                logger.info(f"[本地缓存] {region} 指数行情命中")
+                return cached_payload["data"]
 
         tickflow_fetcher = self._get_tickflow_fetcher()
         if tickflow_fetcher is not None:
@@ -1825,13 +1827,14 @@ class DataFetcherManager:
                 continue
         return []
 
-    def get_market_stats(self) -> Dict[str, Any]:
+    def get_market_stats(self, *, use_cache: bool = True) -> Dict[str, Any]:
         """获取市场涨跌统计（自动切换数据源）"""
         cache_key = self._make_cache_key("market_stats", "cn")
-        cached_payload = self._read_snapshot_cache("market_stats", cache_key, market="cn")
-        if cached_payload and isinstance(cached_payload.get("data"), dict):
-            logger.info("[本地缓存] A股市场统计命中")
-            return cached_payload["data"]
+        if use_cache:
+            cached_payload = self._read_snapshot_cache("market_stats", cache_key, market="cn")
+            if cached_payload and isinstance(cached_payload.get("data"), dict):
+                logger.info("[本地缓存] A股市场统计命中")
+                return cached_payload["data"]
 
         tickflow_fetcher = self._get_tickflow_fetcher()
         if tickflow_fetcher is not None:

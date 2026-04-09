@@ -756,7 +756,9 @@ def _build_stock_picker_schedule_checker():
             schedule_time = "16:00"
 
         now = datetime.now()
-        if now.strftime("%H:%M") != schedule_time:
+        schedule_hour, schedule_minute = (int(part) for part in schedule_time.split(":", 1))
+        scheduled_at = now.replace(hour=schedule_hour, minute=schedule_minute, second=0, microsecond=0)
+        if now < scheduled_at:
             return
 
         trigger_key = f"{now.date().isoformat()}@{schedule_time}"
@@ -880,6 +882,8 @@ def main() -> int:
         logger.info(f"Web 服务运行中: http://{args.host}:{args.port}")
         logger.info("通过 /api/v1/analysis/analyze 接口触发分析")
         logger.info(f"API 文档: http://{args.host}:{args.port}/docs")
+        if getattr(config, 'stock_picker_enabled', True) and getattr(config, 'stock_picker_schedule_enabled', True):
+            start_stock_picker_schedule_background()
         logger.info("按 Ctrl+C 退出...")
         try:
             while True:

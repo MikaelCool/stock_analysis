@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
+from data_provider import DataFetcherManager
 from data_provider.base import canonical_stock_code
 from src.config import get_config
 from src.repositories.portfolio_repo import (
@@ -75,6 +76,7 @@ class PortfolioService:
 
     def __init__(self, repo: Optional[PortfolioRepository] = None):
         self.repo = repo or PortfolioRepository()
+        self._data_manager: Optional[DataFetcherManager] = None
 
     # ------------------------------------------------------------------
     # Account CRUD
@@ -987,7 +989,23 @@ class PortfolioService:
                     }
                 )
 
-            last_price = self.repo.get_latest_close(symbol=symbol, as_of=as_of_date)
+            last_price = None
+            if as_of_date >= date.today():
+                try:
+                    quote = self._get_data_manager().get_realtime_quote(
+                        symbol,
+                        log_final_failure=False,
+                        force_refresh=True,
+                    )
+                    if quote is not None and quote.has_basic_data():
+                        price = float(getattr(quote, "price", 0.0) or 0.0)
+                        if price > 0:
+                            last_price = price
+                except Exception as exc:
+                    logger.debug("Portfolio realtime quote failed for %s: %s", symbol, exc)
+
+            if last_price is None:
+                last_price = self.repo.get_latest_close(symbol=symbol, as_of=as_of_date)
             if last_price is None or last_price <= 0:
                 last_price = avg_cost
 
@@ -1026,6 +1044,11 @@ class PortfolioService:
             total_cost_base += cost_base
 
         return position_rows, lot_rows, market_value_base, total_cost_base, fx_stale
+
+    def _get_data_manager(self) -> DataFetcherManager:
+        if self._data_manager is None:
+            self._data_manager = DataFetcherManager()
+        return self._data_manager
 
     @staticmethod
     def _consume_fifo_lots(

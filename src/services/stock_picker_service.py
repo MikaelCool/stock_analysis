@@ -1394,9 +1394,9 @@ class StockPickerService:
             },
         )
 
-    def _build_market_snapshot(self) -> Dict[str, Any]:
-        indices = self.fetcher_manager.get_main_indices(region="cn") or []
-        stats = self.fetcher_manager.get_market_stats() or {}
+    def _build_market_snapshot(self, *, use_cache: bool = True) -> Dict[str, Any]:
+        indices = self.fetcher_manager.get_main_indices(region="cn", use_cache=use_cache) or []
+        stats = self.fetcher_manager.get_market_stats(use_cache=use_cache) or {}
         score = 50.0
         rising_indices = 0
         for item in indices:
@@ -2407,18 +2407,13 @@ class StockPickerService:
     def get_market_sentiment(self) -> Dict[str, Any]:
         latest_run = self.list_runs(limit=1)
         latest_snapshot = latest_run[0].get("market_snapshot") if latest_run else None
-        updated_at = None
-        if isinstance(latest_snapshot, dict) and latest_snapshot:
-            snapshot = latest_snapshot
-            updated_at = latest_run[0].get("completed_at") or latest_run[0].get("created_at")
-        else:
-            try:
-                snapshot = self._build_market_snapshot()
-                updated_at = datetime.now().isoformat()
-            except Exception as exc:
-                logger.warning("Stock picker market sentiment build failed, fallback to latest run: %s", exc)
-                snapshot = latest_snapshot or {"score": 50.0, "regime": "中性", "summary": "暂无最新大盘情绪数据。"}
-                updated_at = latest_run[0].get("completed_at") if latest_run else datetime.now().isoformat()
+        try:
+            snapshot = self._build_market_snapshot(use_cache=False)
+            updated_at = datetime.now().isoformat()
+        except Exception as exc:
+            logger.warning("Stock picker market sentiment build failed, fallback to latest run: %s", exc)
+            snapshot = latest_snapshot or {"score": 50.0, "regime": "中性", "summary": "暂无最新大盘情绪数据。"}
+            updated_at = latest_run[0].get("completed_at") if latest_run else datetime.now().isoformat()
 
         stats = snapshot.get("stats") if isinstance(snapshot.get("stats"), dict) else {}
         up_count = self._to_float(stats.get("up_count"))

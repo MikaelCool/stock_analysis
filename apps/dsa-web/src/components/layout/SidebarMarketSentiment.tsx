@@ -27,12 +27,21 @@ export const SidebarMarketSentiment: React.FC<SidebarMarketSentimentProps> = ({ 
 
     void loadMarketSentiment();
     const timer = window.setInterval(() => {
+      if (document.hidden) return;
       void loadMarketSentiment();
-    }, 300000);
+    }, 60000);
+
+    const onVisibilityChange = () => {
+      if (!document.hidden) {
+        void loadMarketSentiment();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
 
     return () => {
       cancelled = true;
       window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
     };
   }, []);
 
@@ -53,6 +62,11 @@ export const SidebarMarketSentiment: React.FC<SidebarMarketSentimentProps> = ({ 
       <p className={`mt-2 text-xs leading-5 text-secondary-text ${compact ? 'line-clamp-3' : ''}`}>
         {marketSentiment?.summary ?? '正在获取最新大盘情绪分数。'}
       </p>
+      {marketSentiment?.updatedAt ? (
+        <p className="mt-2 text-[11px] text-secondary-text/80">
+          更新于 {new Date(marketSentiment.updatedAt).toLocaleTimeString('zh-CN', { hour12: false })}
+        </p>
+      ) : null}
     </div>
   );
 };

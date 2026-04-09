@@ -55,7 +55,7 @@ type CorporateListQuery = EventQuery & {
 };
 
 function buildSnapshotParams(query: SnapshotQuery): Record<string, string | number> {
-  const params: Record<string, string | number> = {};
+  const params: Record<string, string | number> = { _t: Date.now() };
   if (query.accountId != null) {
     params.account_id = query.accountId;
   }
