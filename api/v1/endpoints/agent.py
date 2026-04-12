@@ -6,6 +6,7 @@ Agent API endpoints.
 import asyncio
 import json
 import logging
+import re
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -13,7 +14,10 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
+from data_provider import DataFetcherManager
+from data_provider.base import canonical_stock_code
 from src.config import get_config
+from src.services.name_to_code_resolver import resolve_name_to_code
 from src.services.agent_model_service import list_agent_model_deployments
 
 # Tool name -> Chinese display name mapping
@@ -39,6 +43,7 @@ TOOL_DISPLAY_NAMES: Dict[str, str] = {
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+_A_SHARE_CODE_RE = re.compile(r"(?<!\d)([0-9]{6})(?!\d)")
 
 class ChatRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
@@ -167,6 +172,7 @@ async def agent_chat(request: ChatRequest):
         ctx = dict(request.context or {})
         if skills is not None:
             ctx["skills"] = skills
+        ctx = _build_chat_market_context(request.message, ctx)
 
         # Offload the blocking call to a thread to avoid blocking the event loop.
         loop = asyncio.get_running_loop()
@@ -396,6 +402,7 @@ async def agent_chat_stream(request: ChatRequest):
     stream_ctx = dict(request.context or {})
     if skills is not None:
         stream_ctx["skills"] = skills
+    stream_ctx = _build_chat_market_context(request.message, stream_ctx)
 
     def progress_callback(event: dict):
         # Enrich tool events with display names
@@ -464,3 +471,79 @@ async def agent_chat_stream(request: ChatRequest):
             "Connection": "keep-alive",
         },
     )
+
+
+def _infer_chat_stock_code(message: str, context: Optional[Dict[str, Any]]) -> Optional[str]:
+    raw_context = context or {}
+    context_code = str(raw_context.get("stock_code") or "").strip()
+    if context_code:
+        try:
+            return canonical_stock_code(context_code)
+        except Exception:
+            return context_code
+
+    match = _A_SHARE_CODE_RE.search(message or "")
+    if match:
+        return canonical_stock_code(match.group(1))
+
+    text = (message or "").strip()
+    if not text or len(text) > 24:
+        return None
+
+    resolved = resolve_name_to_code(text)
+    if resolved and str(resolved).isdigit() and len(str(resolved)) == 6:
+        return canonical_stock_code(str(resolved))
+    return None
+
+
+def _build_chat_market_context(message: str, context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    enriched = dict(context or {})
+    stock_code = _infer_chat_stock_code(message, enriched)
+    if not stock_code:
+        return enriched
+
+    manager = DataFetcherManager()
+    errors: List[str] = list(enriched.get("data_fetch_errors") or [])
+    enriched["stock_code"] = stock_code
+
+    try:
+        quote = manager.get_realtime_quote(stock_code, log_final_failure=False)
+        if quote is not None:
+            enriched["stock_name"] = enriched.get("stock_name") or getattr(quote, "name", None)
+            enriched["realtime_quote"] = {
+                "code": getattr(quote, "code", stock_code),
+                "name": getattr(quote, "name", None),
+                "price": getattr(quote, "price", None),
+                "change_amount": getattr(quote, "change_amount", None),
+                "change_pct": getattr(quote, "change_pct", None),
+                "open_price": getattr(quote, "open_price", None),
+                "high": getattr(quote, "high", None),
+                "low": getattr(quote, "low", None),
+                "pre_close": getattr(quote, "pre_close", None),
+                "volume": getattr(quote, "volume", None),
+                "amount": getattr(quote, "amount", None),
+                "source": getattr(getattr(quote, "source", None), "value", getattr(quote, "source", None)),
+            }
+    except Exception as exc:
+        errors.append(f"realtime_quote: {exc}")
+
+    try:
+        history, source = manager.get_daily_data(stock_code, days=60)
+        if history is not None and not history.empty:
+            frame = history.sort_values("date").tail(20).copy()
+            frame["date"] = frame["date"].astype(str)
+            daily_history = frame.to_dict("records")
+            enriched["daily_history"] = {
+                "source": source,
+                "bars": daily_history,
+            }
+            if not enriched.get("stock_name"):
+                stock_name = manager.get_stock_name(stock_code)
+                if stock_name:
+                    enriched["stock_name"] = stock_name
+    except Exception as exc:
+        errors.append(f"daily_history: {exc}")
+
+    if errors:
+        enriched["data_fetch_errors"] = errors
+    return enriched

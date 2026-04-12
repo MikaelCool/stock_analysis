@@ -755,20 +755,30 @@ def _build_stock_picker_schedule_checker():
         except Exception:
             schedule_time = "16:00"
 
-        now = datetime.now()
+        from src.core.trading_calendar import get_market_now
+        from src.services.stock_picker_service import StockPickerService
+
+        now = get_market_now("cn")
+        today = now.date()
+        if today.weekday() >= 5:
+            return
+
+        picker = StockPickerService(config=runtime_config)
+        effective_trade_date = picker._resolve_scan_trade_date()
+        if effective_trade_date != today:
+            return
+
         schedule_hour, schedule_minute = (int(part) for part in schedule_time.split(":", 1))
         scheduled_at = now.replace(hour=schedule_hour, minute=schedule_minute, second=0, microsecond=0)
         if now < scheduled_at:
             return
 
-        trigger_key = f"{now.date().isoformat()}@{schedule_time}"
+        trigger_key = f"{today.isoformat()}@{schedule_time}"
         if state["last_trigger_key"] == trigger_key:
             return
 
-        from src.services.stock_picker_service import StockPickerService
-
         logger.info("触发定时选股任务: strategy=mainboard_swing_master time=%s", schedule_time)
-        StockPickerService(config=runtime_config).run_scheduled_scan()
+        picker.run_scheduled_scan()
         state["last_trigger_key"] = trigger_key
 
     return _checker

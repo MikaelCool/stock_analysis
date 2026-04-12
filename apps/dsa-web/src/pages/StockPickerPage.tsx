@@ -593,11 +593,14 @@ function buildOptimizationSummary(optimization: unknown) {
     paragraphs.push(
       `该组参数的平均收益约为 ${Number.isFinite(avgReturn) ? avgReturn.toFixed(2) : '0.00'}%，胜率约为 ${Number.isFinite(winRate) ? winRate.toFixed(2) : '0.00'}%。`,
     );
+    paragraphs.push('当前优化器只会调整量化阈值参数，不会自动新增或删除量化因子；若要升级策略因子，需要改策略逻辑或 YAML。');
   } else if (status === 'insufficient_data') {
     paragraphs.push('历史样本暂时不足，当前展示的是默认参数或最近一次可用参数。');
   } else {
     paragraphs.push('优化任务尚未形成稳定结论，建议继续积累样本后再观察。');
   }
+
+  paragraphs.push('前 5 只候选股的 T+1 / T+3 / T+5 / T+10 回测已经展示在每只股票卡片右侧，更适合直接复核单票表现。');
 
   return {
     available: entries.length > 0,

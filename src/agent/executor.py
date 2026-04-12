@@ -551,6 +551,9 @@ class AgentExecutor:
         # Inject previous analysis context if provided (data reuse from report follow-up)
         if context:
             context_parts = []
+            has_prefetched_market_data = bool(
+                context.get("realtime_quote") or context.get("daily_history") or context.get("data_fetch_errors")
+            )
             if context.get("stock_code"):
                 context_parts.append(f"股票代码: {context['stock_code']}")
             if context.get("stock_name"):
@@ -567,10 +570,31 @@ class AgentExecutor:
                 strategy = context["previous_strategy"]
                 strategy_text = json.dumps(strategy, ensure_ascii=False) if isinstance(strategy, dict) else str(strategy)
                 context_parts.append(f"上次策略分析:\n{strategy_text}")
+            if context.get("realtime_quote"):
+                context_parts.append(
+                    f"系统已预取的实时行情:\n{json.dumps(context['realtime_quote'], ensure_ascii=False)}"
+                )
+            if context.get("daily_history"):
+                context_parts.append(
+                    f"系统已预取的历史K线:\n{json.dumps(context['daily_history'], ensure_ascii=False)}"
+                )
+            if context.get("data_fetch_errors"):
+                context_parts.append(
+                    f"系统取数告警:\n{json.dumps(context['data_fetch_errors'], ensure_ascii=False)}"
+                )
             if context_parts:
-                context_msg = "[系统提供的历史分析上下文，可供参考对比]\n" + "\n".join(context_parts)
+                if has_prefetched_market_data:
+                    context_msg = (
+                        "[系统提供的行情上下文，优先基于这些真实数据作答]\n"
+                        "请先明确引用已拿到的实时/历史数据，再给判断。\n"
+                        "不要只回复“我去获取数据”“分阶段分析”等过程性话术；如果还有缺口，再明确指出缺了什么。\n"
+                        + "\n".join(context_parts)
+                    )
+                else:
+                    context_msg = "[系统提供的历史分析上下文，可供参考对比]\n" + "\n".join(context_parts)
                 messages.append({"role": "user", "content": context_msg})
-                messages.append({"role": "assistant", "content": "好的，我已了解该股票的历史分析数据。请告诉我你想了解什么？"})
+                if not has_prefetched_market_data:
+                    messages.append({"role": "assistant", "content": "好的，我已了解该股票的历史分析数据。请告诉我你想了解什么？"})
 
         messages.append({"role": "user", "content": message})
 

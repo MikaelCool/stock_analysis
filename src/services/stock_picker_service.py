@@ -339,6 +339,7 @@ class StockPickerService:
                 {
                     "code": code,
                     "name": item["name"],
+                    "scan_date": effective_scan_date.isoformat(),
                     "strategy_id": strategy["strategy_id"],
                     "setup_type": signal.setup_type,
                     "score": round(signal.score, 2),
@@ -476,6 +477,38 @@ class StockPickerService:
                 .where(StockSelectionCandidate.run_id == run.id)
                 .order_by(StockSelectionCandidate.rank.asc(), StockSelectionCandidate.score.desc())
             ).scalars().all()
+            repaired = False
+            if candidates:
+                strategy = self._resolve_strategy(run.strategy_id)
+                market_snapshot = self._safe_json_loads(run.market_snapshot_json) or {}
+                us_snapshot = self._safe_json_loads(run.us_market_snapshot_json) or {}
+                for idx, item in enumerate(candidates):
+                    if idx >= _MAX_REPORT_CANDIDATES:
+                        break
+                    if not self._is_placeholder_action_plan(item.action_plan_markdown):
+                        continue
+                    candidate_payload = {
+                        "code": item.code,
+                        "name": item.name,
+                        "scan_date": item.scan_date.isoformat() if item.scan_date else None,
+                        "strategy_id": item.strategy_id,
+                        "setup_type": item.setup_type,
+                        "score": float(item.score or 0.0),
+                        "analysis_summary": item.analysis_summary,
+                        "stop_loss": item.stop_loss,
+                        "take_profit": item.take_profit,
+                        "metrics": self._safe_json_loads(item.indicator_snapshot_json) or {},
+                    }
+                    item.action_plan_markdown = self._build_template_action_plan(
+                        candidate=candidate_payload,
+                        strategy=strategy,
+                        market_snapshot=market_snapshot,
+                        us_snapshot=us_snapshot,
+                        review_text=None,
+                    )
+                    repaired = True
+                if repaired:
+                    session.commit()
             candidate_ids = [item.id for item in candidates]
             backtests_by_candidate: Dict[int, List[StockSelectionBacktest]] = {}
             if candidate_ids:
@@ -605,7 +638,16 @@ class StockPickerService:
         text = (value or "").strip()
         if not text:
             return True
-        return "后台正在生成次日操作手册" in text
+        if "后台正在生成次日操作手册" in text:
+            return True
+        malformed_markers = (
+            "收盘 -",
+            "MA5/10/20/30/60=-/-/-/-/-",
+            "低吸挂单价：0.01",
+            "突破跟单价：0.01",
+            "止损价：0.01",
+        )
+        return any(marker in text for marker in malformed_markers)
 
     def _repair_stuck_run(self, *, run_id: int) -> None:
         with self.db.session_scope() as session:
@@ -633,12 +675,14 @@ class StockPickerService:
                 candidate_payload = {
                     "code": row.code,
                     "name": row.name,
+                    "scan_date": row.scan_date.isoformat() if row.scan_date else None,
                     "strategy_id": row.strategy_id,
                     "setup_type": row.setup_type,
                     "score": float(row.score or 0.0),
                     "analysis_summary": row.analysis_summary,
                     "stop_loss": row.stop_loss,
                     "take_profit": row.take_profit,
+                    "metrics": self._safe_json_loads(row.metrics_json) or {},
                 }
                 row.action_plan_markdown = self._build_template_action_plan(
                     candidate=candidate_payload,
