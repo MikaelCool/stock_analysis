@@ -2157,6 +2157,304 @@ def _picker_run_to_dict(
     return payload
 
 
+def _picker_get_latest_optimization(
+    self: StockPickerService,
+    strategy_id: str,
+) -> Optional[Dict[str, Any]]:
+    with self.db.get_session() as session:
+        rows = session.execute(
+            select(StockSelectionOptimization)
+            .where(StockSelectionOptimization.strategy_id == strategy_id)
+            .order_by(desc(StockSelectionOptimization.created_at))
+            .limit(12)
+        ).scalars().all()
+
+    for row in rows:
+        params = self._safe_json_loads(row.params_json)
+        metrics = self._safe_json_loads(row.metrics_json)
+        if not isinstance(params, dict):
+            continue
+        if not isinstance(metrics, dict):
+            metrics = {}
+        if (row.status or "").strip().lower() != "completed":
+            continue
+        sample_count = int(self._to_float(metrics.get("sample_count"), 0.0))
+        if sample_count < 6:
+            continue
+        return {
+            "id": row.id,
+            "strategy_id": row.strategy_id,
+            "strategy_name": row.strategy_name,
+            "lookback_days": int(row.lookback_days or 0),
+            "selected_horizon_days": int(row.selected_horizon_days or 0),
+            "status": row.status,
+            "params": params,
+            "metrics": metrics,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        }
+    return None
+
+
+def _picker_save_scan_run(
+    self: StockPickerService,
+    *,
+    query_id: str,
+    strategy: Dict[str, Any],
+    scan_date: date,
+    total_scanned: int,
+    matched_count: int,
+    selected: Sequence[Dict[str, Any]],
+    market_snapshot: Dict[str, Any],
+    us_snapshot: Dict[str, Any],
+    optimization: Optional[Dict[str, Any]],
+    status: str,
+) -> int:
+    summary_markdown = self._build_run_summary_markdown(
+        strategy=strategy,
+        scan_date=scan_date,
+        selected=selected,
+        market_snapshot=market_snapshot,
+        us_snapshot=us_snapshot,
+    )
+
+    with self.db.session_scope() as session:
+        run = StockSelectionRun(
+            query_id=query_id,
+            strategy_id=strategy["strategy_id"],
+            strategy_name=strategy["name"],
+            scan_date=scan_date,
+            status=status,
+            total_scanned=int(total_scanned or 0),
+            matched_count=int(matched_count or 0),
+            selected_count=len(selected),
+            market_snapshot_json=json.dumps(market_snapshot or {}, ensure_ascii=False),
+            us_market_snapshot_json=json.dumps(us_snapshot or {}, ensure_ascii=False),
+            optimization_snapshot_json=json.dumps(optimization or {}, ensure_ascii=False),
+            summary_markdown=summary_markdown,
+            created_at=datetime.now(),
+            completed_at=datetime.now() if status == "completed" else None,
+        )
+        session.add(run)
+        session.flush()
+
+        for candidate in selected:
+            session.add(
+                StockSelectionCandidate(
+                    run_id=run.id,
+                    code=str(candidate.get("code") or "").strip(),
+                    name=str(candidate.get("name") or "").strip(),
+                    strategy_id=str(candidate.get("strategy_id") or strategy["strategy_id"]),
+                    scan_date=scan_date,
+                    setup_type=str(candidate.get("setup_type") or "mixed"),
+                    score=float(candidate.get("score") or 0.0),
+                    rank=int(candidate.get("rank") or 0),
+                    selected=True,
+                    operation_advice=str(candidate.get("operation_advice") or ""),
+                    analysis_summary=candidate.get("analysis_summary"),
+                    action_plan_markdown=candidate.get("action_plan_markdown"),
+                    reason_json=json.dumps(candidate.get("reasons") or [], ensure_ascii=False),
+                    indicator_snapshot_json=json.dumps(candidate.get("metrics") or {}, ensure_ascii=False),
+                    market_context_json=json.dumps(candidate.get("market_context") or {}, ensure_ascii=False),
+                    news_context_json=json.dumps(candidate.get("news_context"), ensure_ascii=False)
+                    if candidate.get("news_context") is not None
+                    else None,
+                    llm_model=candidate.get("llm_model"),
+                    stop_loss=self._to_float(candidate.get("stop_loss")) if candidate.get("stop_loss") not in (None, "") else None,
+                    take_profit=self._to_float(candidate.get("take_profit")) if candidate.get("take_profit") not in (None, "") else None,
+                    created_at=datetime.now(),
+                )
+            )
+        session.flush()
+        return int(run.id)
+
+
+def _picker_update_run_optimization(
+    self: StockPickerService,
+    *,
+    run_id: int,
+    optimization: Optional[Dict[str, Any]],
+) -> None:
+    with self.db.session_scope() as session:
+        run = session.execute(
+            select(StockSelectionRun).where(StockSelectionRun.id == run_id)
+        ).scalar_one_or_none()
+        if run is None:
+            return
+        run.optimization_snapshot_json = json.dumps(optimization or {}, ensure_ascii=False)
+
+
+def _picker_load_forward_bars(
+    self: StockPickerService,
+    code: str,
+    scan_date: date,
+    max_days: int,
+) -> pd.DataFrame:
+    with self.db.get_session() as session:
+        rows = session.execute(
+            select(StockDaily)
+            .where(
+                and_(
+                    StockDaily.code == code,
+                    StockDaily.date > scan_date,
+                )
+            )
+            .order_by(StockDaily.date.asc())
+            .limit(max(max_days, 1))
+        ).scalars().all()
+    if not rows:
+        return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume", "amount"])
+    return pd.DataFrame(
+        [
+            {
+                "date": row.date,
+                "open": self._to_float(row.open),
+                "high": self._to_float(row.high),
+                "low": self._to_float(row.low),
+                "close": self._to_float(row.close),
+                "volume": self._to_float(row.volume),
+                "amount": self._to_float(row.amount),
+            }
+            for row in rows
+        ]
+    )
+
+
+def _picker_evaluate_candidate_horizon(
+    self: StockPickerService,
+    candidate: StockSelectionCandidate,
+    bars: pd.DataFrame,
+    horizon: int,
+) -> Dict[str, Any]:
+    if bars is None or bars.empty or len(bars) < horizon:
+        return {"status": "pending"}
+
+    window = bars.head(horizon).reset_index(drop=True)
+    entry_bar = window.iloc[0]
+    exit_bar = window.iloc[horizon - 1]
+    entry_price = self._to_float(entry_bar.get("open")) or self._to_float(entry_bar.get("close"))
+    exit_price = self._to_float(exit_bar.get("close"))
+    if entry_price <= 0 or exit_price <= 0:
+        return {"status": "pending"}
+
+    max_high = self._to_float(window["high"].max())
+    min_low = self._to_float(window["low"].min())
+    return_pct = (exit_price - entry_price) / max(entry_price, 0.01) * 100.0
+    max_drawdown_pct = (min_low - entry_price) / max(entry_price, 0.01) * 100.0
+    if return_pct > 0.8:
+        outcome = "win"
+    elif return_pct < -0.8:
+        outcome = "loss"
+    else:
+        outcome = "neutral"
+
+    return {
+        "status": "completed",
+        "entry_date": entry_bar.get("date"),
+        "exit_date": exit_bar.get("date"),
+        "entry_price": round(entry_price, 2),
+        "exit_price": round(exit_price, 2),
+        "end_close": round(self._to_float(exit_bar.get("close")), 2),
+        "max_high": round(max_high, 2),
+        "min_low": round(min_low, 2),
+        "return_pct": round(return_pct, 2),
+        "max_drawdown_pct": round(max_drawdown_pct, 2),
+        "outcome": outcome,
+    }
+
+
+def _picker_load_universe_from_local_db(self: StockPickerService) -> pd.DataFrame:
+    with self.db.get_session() as session:
+        rows = session.execute(
+            select(StockDaily.code)
+            .group_by(StockDaily.code)
+            .order_by(StockDaily.code.asc())
+        ).all()
+    if not rows:
+        return pd.DataFrame(columns=["code", "name"])
+    return pd.DataFrame(
+        [
+            {
+                "code": str(code or "").strip(),
+                "name": str(code or "").strip(),
+            }
+            for (code,) in rows
+            if str(code or "").strip()
+        ]
+    )
+
+
+def _picker_resolve_scan_trade_date(self: StockPickerService) -> date:
+    today = date.today()
+    if self.tushare_fetcher.is_available():
+        try:
+            trade_dates = self.tushare_fetcher._get_trade_dates(end_date=today.strftime("%Y%m%d"))
+            if trade_dates:
+                return datetime.strptime(trade_dates[0], "%Y%m%d").date()
+        except Exception as exc:
+            logger.warning("Stock picker failed to resolve Tushare trade date: %s", exc)
+
+    latest_db_date = self._get_latest_daily_date()
+    if latest_db_date is not None and latest_db_date <= today:
+        return latest_db_date
+
+    if today.weekday() == 5:
+        return today - timedelta(days=1)
+    if today.weekday() == 6:
+        return today - timedelta(days=2)
+    return today
+
+
+def _picker_is_reusable_run_payload(self: StockPickerService, payload: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+
+    status = str(payload.get("status") or "").strip().lower()
+    total_scanned = int(payload.get("total_scanned") or 0)
+    selected_count = int(payload.get("selected_count") or 0)
+    candidates = list(payload.get("candidates") or [])
+
+    if status != "completed":
+        return False
+    if total_scanned < 1000:
+        return False
+    if selected_count <= 0:
+        return True
+    if not candidates:
+        return False
+
+    top_candidates = candidates[: min(len(candidates), _MAX_REPORT_CANDIDATES)]
+    return all(
+        not self._is_placeholder_action_plan(item.get("action_plan_markdown"))
+        and str(item.get("action_plan_markdown") or "").strip()
+        for item in top_candidates
+    )
+
+
+def _picker_run_scheduled_scan(self: StockPickerService) -> Dict[str, Any]:
+    strategy_id = "mainboard_swing_master"
+    scan_date = self._resolve_scan_trade_date()
+
+    with self._schedule_lock:
+        existing_run = self._find_latest_run_for_date(strategy_id=strategy_id, scan_date=scan_date)
+        if existing_run is not None:
+            self._repair_stuck_run(run_id=existing_run)
+            payload = self.get_run_detail(existing_run)
+            if self._is_reusable_run_payload(payload):
+                return payload
+            logger.warning(
+                "Stock picker will rerun scheduled scan because existing run is incomplete or unusable: run_id=%s scan_date=%s",
+                existing_run,
+                scan_date,
+            )
+
+        return self.run_scan(
+            strategy_id=strategy_id,
+            scan_date=scan_date,
+            max_candidates=_MAX_SELECTED_CANDIDATES,
+            send_notification=True,
+        )
+
+
 def _picker_get_latest_market_snapshot(self: StockPickerService) -> Dict[str, Any]:
     with self.db.get_session() as session:
         row = session.execute(
@@ -2276,6 +2574,15 @@ StockPickerService._safe_json_loads = _picker_safe_json_loads
 StockPickerService._backtest_to_dict = _picker_backtest_to_dict
 StockPickerService._candidate_to_dict = _picker_candidate_to_dict
 StockPickerService._run_to_dict = _picker_run_to_dict
+StockPickerService._get_latest_optimization = _picker_get_latest_optimization
+StockPickerService._save_scan_run = _picker_save_scan_run
+StockPickerService._update_run_optimization = _picker_update_run_optimization
+StockPickerService._load_forward_bars = _picker_load_forward_bars
+StockPickerService._evaluate_candidate_horizon = _picker_evaluate_candidate_horizon
+StockPickerService._load_universe_from_local_db = _picker_load_universe_from_local_db
+StockPickerService._resolve_scan_trade_date = _picker_resolve_scan_trade_date
+StockPickerService._is_reusable_run_payload = _picker_is_reusable_run_payload
+StockPickerService.run_scheduled_scan = _picker_run_scheduled_scan
 StockPickerService._get_latest_market_snapshot = _picker_get_latest_market_snapshot
 StockPickerService.get_market_sentiment = _picker_get_market_sentiment
 StockPickerService._build_notification_markdown = _picker_build_notification_markdown
