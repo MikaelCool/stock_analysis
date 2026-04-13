@@ -6,9 +6,12 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
+import subprocess
+import sys
 import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, time as dt_time, timedelta
 from pathlib import Path
@@ -20,10 +23,10 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from data_provider import DataFetcherManager
 from data_provider.baostock_fetcher import BaostockFetcher
-from data_provider.tushare_fetcher import TushareFetcher
 from src.agent.skills.base import load_skills_from_directory
 from src.analyzer import GeminiAnalyzer
 from src.config import get_config
+from src.core.trading_calendar import get_effective_trading_date
 from src.notification import NotificationService
 from src.search_service import SearchResponse, SearchResult, SearchService
 from src.storage import (
@@ -40,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 BACKTEST_HORIZONS = (1, 3, 5, 10)
 _BUILTIN_STRATEGY_DIR = Path(__file__).resolve().parents[2] / "strategies"
+_ENRICHMENT_LOG_DIR = Path(__file__).resolve().parents[2] / "logs" / "picker_enrichment"
 _MAX_SELECTED_CANDIDATES = 10
 _MAX_REPORT_CANDIDATES = 5
 
@@ -193,9 +197,6 @@ class StockPickerService:
         self.config = config or get_config()
         self.db = db_manager or DatabaseManager.get_instance()
         self.fetcher_manager = DataFetcherManager()
-        self.tushare_fetcher = TushareFetcher(
-            rate_limit_per_minute=getattr(self.config, "tushare_rate_limit_per_minute", 80)
-        )
         self.search_service = None
         try:
             self.search_service = SearchService(
@@ -285,7 +286,7 @@ class StockPickerService:
         scan_date: Optional[date] = None,
         max_candidates: Optional[int] = None,
         strategy_params: Optional[Dict[str, Any]] = None,
-        send_notification: bool = False,
+        send_notification: bool = True,
         force_refresh: bool = False,
     ) -> Dict[str, Any]:
         if not getattr(self.config, "stock_picker_enabled", True):
@@ -371,20 +372,10 @@ class StockPickerService:
                 2,
             )
             if idx < llm_review_limit:
-                candidate["action_plan_markdown"] = "后台正在生成次日操作手册和消息面复核，完成后会自动更新。"
+                candidate["action_plan_markdown"] = "增强链路正在生成最终版操作手册，完成后会自动更新并推送到飞书。"
             else:
                 candidate["action_plan_markdown"] = "该票保留为量化候选，系统只对前 5 只生成详细操作手册。"
             candidate["llm_model"] = None
-            if idx < llm_review_limit:
-                candidate["action_plan_markdown"] = self._build_template_action_plan(
-                    candidate=candidate,
-                    strategy=strategy,
-                    market_snapshot=market_snapshot,
-                    us_snapshot=us_snapshot,
-                    review_text=None,
-                )
-            else:
-                candidate["action_plan_markdown"] = "该票保留为量化候选，系统只对前 5 只生成详细操作手册。"
 
         query_id = uuid.uuid4().hex
         run_id = self._save_scan_run(
@@ -413,9 +404,6 @@ class StockPickerService:
         result = self.get_run_detail(run_id)
         if result is None:
             raise RuntimeError("scan run saved but detail lookup failed")
-        if send_notification:
-            result["notification_stage"] = "initial"
-            self._send_scan_notification(result)
         return result
 
     @staticmethod
@@ -477,38 +465,6 @@ class StockPickerService:
                 .where(StockSelectionCandidate.run_id == run.id)
                 .order_by(StockSelectionCandidate.rank.asc(), StockSelectionCandidate.score.desc())
             ).scalars().all()
-            repaired = False
-            if candidates:
-                strategy = self._resolve_strategy(run.strategy_id)
-                market_snapshot = self._safe_json_loads(run.market_snapshot_json) or {}
-                us_snapshot = self._safe_json_loads(run.us_market_snapshot_json) or {}
-                for idx, item in enumerate(candidates):
-                    if idx >= _MAX_REPORT_CANDIDATES:
-                        break
-                    if not self._is_placeholder_action_plan(item.action_plan_markdown):
-                        continue
-                    candidate_payload = {
-                        "code": item.code,
-                        "name": item.name,
-                        "scan_date": item.scan_date.isoformat() if item.scan_date else None,
-                        "strategy_id": item.strategy_id,
-                        "setup_type": item.setup_type,
-                        "score": float(item.score or 0.0),
-                        "analysis_summary": item.analysis_summary,
-                        "stop_loss": item.stop_loss,
-                        "take_profit": item.take_profit,
-                        "metrics": self._safe_json_loads(item.indicator_snapshot_json) or {},
-                    }
-                    item.action_plan_markdown = self._build_template_action_plan(
-                        candidate=candidate_payload,
-                        strategy=strategy,
-                        market_snapshot=market_snapshot,
-                        us_snapshot=us_snapshot,
-                        review_text=None,
-                    )
-                    repaired = True
-                if repaired:
-                    session.commit()
             candidate_ids = [item.id for item in candidates]
             backtests_by_candidate: Dict[int, List[StockSelectionBacktest]] = {}
             if candidate_ids:
@@ -539,17 +495,25 @@ class StockPickerService:
         us_snapshot: Dict[str, Any],
         send_notification: bool,
     ) -> None:
-        self._background_executor.submit(
-            self._run_enrichment_worker,
-            run_id,
-            query_id,
-            dict(strategy),
-            scan_date,
-            llm_review_limit,
-            dict(market_snapshot),
-            dict(us_snapshot),
-            send_notification,
-        )
+        if not self._acquire_enrichment_lock(run_id):
+            logger.info("Stock picker enrichment already active for run %s, skipping duplicate enqueue", run_id)
+            return
+
+        try:
+            self._background_executor.submit(
+                type(self)._run_enrichment_worker,
+                run_id,
+                query_id,
+                dict(strategy),
+                scan_date,
+                llm_review_limit,
+                dict(market_snapshot),
+                dict(us_snapshot),
+                send_notification,
+            )
+        except Exception:
+            self._release_enrichment_lock(run_id)
+            raise
 
     @classmethod
     def _run_enrichment_worker(
@@ -566,22 +530,23 @@ class StockPickerService:
         service = cls(config=get_config())
         service._update_run_status(run_id=run_id, status="enriching", completed=False)
         try:
-            with service.db.session_scope() as session:
+            with service.db.get_session() as session:
                 candidate_rows = session.execute(
                     select(StockSelectionCandidate)
                     .where(StockSelectionCandidate.run_id == run_id)
                     .order_by(StockSelectionCandidate.rank.asc(), StockSelectionCandidate.score.desc())
                 ).scalars().all()
 
-                for idx, row in enumerate(candidate_rows):
-                    if idx >= llm_review_limit:
-                        row.action_plan_markdown = row.action_plan_markdown or "该票保留为量化候选，系统只对前 5 只生成详细操作手册。"
-                        continue
-
-                    candidate_payload = {
+            candidate_records: List[Dict[str, Any]] = []
+            for idx, row in enumerate(candidate_rows):
+                candidate_records.append(
+                    {
+                        "id": int(row.id),
+                        "rank": idx + 1,
                         "code": row.code,
                         "name": row.name,
                         "strategy_id": row.strategy_id,
+                        "scan_date": row.scan_date.isoformat() if row.scan_date else scan_date.isoformat(),
                         "setup_type": row.setup_type,
                         "score": float(row.score or 0.0),
                         "operation_advice": row.operation_advice,
@@ -592,22 +557,97 @@ class StockPickerService:
                         "metrics": service._safe_json_loads(row.indicator_snapshot_json) or {},
                         "market_context": service._safe_json_loads(row.market_context_json) or {},
                     }
+                )
+
+            def enrich_candidate(candidate_payload: Dict[str, Any]) -> Dict[str, Any]:
+                review_payload: Dict[str, Any] = {"news_context": None, "news_score": 50.0, "from_cache": False}
+                try:
                     review_payload = service._collect_candidate_intel(
-                        code=row.code,
-                        name=row.name or row.code,
+                        code=str(candidate_payload.get("code") or ""),
+                        name=str(candidate_payload.get("name") or candidate_payload.get("code") or ""),
                         scan_date=scan_date,
                         query_id=query_id,
                     )
-                    row.news_context_json = json.dumps(review_payload.get("news_context"), ensure_ascii=False)
+                except Exception as exc:
+                    logger.warning(
+                        "Stock picker intel enrichment failed for run %s %s: %s",
+                        run_id,
+                        candidate_payload.get("code"),
+                        exc,
+                    )
+
+                try:
                     action_plan, llm_model = service._build_action_plan(
-                        candidate=candidate_payload,
+                        candidate=dict(candidate_payload),
                         strategy=strategy,
                         market_snapshot=market_snapshot,
                         us_snapshot=us_snapshot,
                         review_payload=review_payload,
                     )
-                    row.action_plan_markdown = action_plan
-                    row.llm_model = llm_model
+                except Exception as exc:
+                    logger.warning(
+                        "Stock picker action plan retrying without news for run %s %s: %s",
+                        run_id,
+                        candidate_payload.get("code"),
+                        exc,
+                    )
+                    action_plan, llm_model = service._build_action_plan(
+                        candidate=dict(candidate_payload),
+                        strategy=strategy,
+                        market_snapshot=market_snapshot,
+                        us_snapshot=us_snapshot,
+                        review_payload={"news_context": None, "news_score": 50.0, "from_cache": False},
+                    )
+
+                return {
+                    "id": int(candidate_payload["id"]),
+                    "news_context_json": json.dumps(review_payload.get("news_context"), ensure_ascii=False)
+                    if review_payload.get("news_context") is not None
+                    else None,
+                    "action_plan_markdown": action_plan,
+                    "llm_model": llm_model,
+                }
+
+            enriched_updates: Dict[int, Dict[str, Any]] = {}
+            report_candidates = candidate_records[: max(0, llm_review_limit)]
+            if report_candidates:
+                worker_count = min(max(1, len(report_candidates)), 3)
+                with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="picker_enrich") as executor:
+                    futures = {
+                        executor.submit(enrich_candidate, candidate_payload): candidate_payload
+                        for candidate_payload in report_candidates
+                    }
+                    for future in as_completed(futures):
+                        candidate_payload = futures[future]
+                        try:
+                            update = future.result()
+                        except Exception as exc:
+                            code = str(candidate_payload.get("code") or "")
+                            logger.warning(
+                                "Stock picker action plan enrichment failed for run %s %s: %s",
+                                run_id,
+                                code,
+                                exc,
+                            )
+                            raise RuntimeError(f"{code} 操作手册生成失败: {exc}") from exc
+                        enriched_updates[int(update["id"])] = update
+
+            with service.db.session_scope() as session:
+                rows = session.execute(
+                    select(StockSelectionCandidate)
+                    .where(StockSelectionCandidate.run_id == run_id)
+                    .order_by(StockSelectionCandidate.rank.asc(), StockSelectionCandidate.score.desc())
+                ).scalars().all()
+                for idx, row in enumerate(rows):
+                    if idx >= llm_review_limit:
+                        row.action_plan_markdown = row.action_plan_markdown or "该票保留为量化候选，系统只对前 5 只生成详细操作手册。"
+                        continue
+                    update = enriched_updates.get(int(row.id))
+                    if update is None:
+                        raise RuntimeError(f"{row.code} 操作手册生成失败: 未生成有效结果")
+                    row.news_context_json = update.get("news_context_json")
+                    row.action_plan_markdown = str(update.get("action_plan_markdown") or "").strip()
+                    row.llm_model = update.get("llm_model")
 
             service._update_run_status(run_id=run_id, status="completed", completed=True)
             payload = service.get_run_detail(run_id)
@@ -629,9 +669,9 @@ class StockPickerService:
                 payload["optimization"] = optimization
         except Exception as exc:
             logger.exception("Stock picker background enrichment failed for run %s: %s", run_id, exc)
-            current = service.get_run_detail(run_id)
-            if current is None or current.get("status") != "completed":
-                service._update_run_status(run_id=run_id, status="failed", completed=False)
+            service._update_run_status(run_id=run_id, status="failed", completed=False)
+        finally:
+            service._release_enrichment_lock(run_id)
 
     @staticmethod
     def _is_placeholder_action_plan(value: Optional[str]) -> bool:
@@ -657,52 +697,16 @@ class StockPickerService:
             if run is None or run.status not in ("queued", "enriching"):
                 return
 
-            strategy = self._resolve_strategy(run.strategy_id)
-            market_snapshot = self._safe_json_loads(run.market_snapshot_json) or {}
-            us_snapshot = self._safe_json_loads(run.us_market_snapshot_json) or {}
             candidate_rows = session.execute(
                 select(StockSelectionCandidate)
                 .where(StockSelectionCandidate.run_id == run_id)
                 .order_by(StockSelectionCandidate.rank.asc(), StockSelectionCandidate.score.desc())
             ).scalars().all()
 
-            repaired = False
-            for idx, row in enumerate(candidate_rows):
-                if idx >= _MAX_REPORT_CANDIDATES:
-                    break
-                if not self._is_placeholder_action_plan(row.action_plan_markdown):
-                    continue
-                candidate_payload = {
-                    "code": row.code,
-                    "name": row.name,
-                    "scan_date": row.scan_date.isoformat() if row.scan_date else None,
-                    "strategy_id": row.strategy_id,
-                    "setup_type": row.setup_type,
-                    "score": float(row.score or 0.0),
-                    "analysis_summary": row.analysis_summary,
-                    "stop_loss": row.stop_loss,
-                    "take_profit": row.take_profit,
-                    "metrics": self._safe_json_loads(row.metrics_json) or {},
-                }
-                row.action_plan_markdown = self._build_template_action_plan(
-                    candidate=candidate_payload,
-                    strategy=strategy,
-                    market_snapshot=market_snapshot,
-                    us_snapshot=us_snapshot,
-                    review_text=None,
-                )
-                repaired = True
-
-            if not repaired:
-                return
-
-            run.status = "completed"
-            run.completed_at = datetime.now()
-
-        payload = self.get_run_detail(run_id)
-        if payload is not None:
-            payload["notification_stage"] = "enhanced"
-            self._send_scan_notification(payload)
+            top_rows = candidate_rows[:_MAX_REPORT_CANDIDATES]
+            if top_rows and any(self._is_placeholder_action_plan(row.action_plan_markdown) for row in top_rows):
+                run.status = "failed"
+                run.completed_at = None
 
     def _repair_stale_runs(self, *, older_than_minutes: int = 10) -> None:
         cutoff = datetime.now() - timedelta(minutes=max(1, older_than_minutes))
@@ -750,6 +754,45 @@ class StockPickerService:
             run.status = status
             if completed:
                 run.completed_at = datetime.now()
+            else:
+                run.completed_at = None
+
+    @staticmethod
+    def _enrichment_lock_path(run_id: int) -> Path:
+        _ENRICHMENT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        return _ENRICHMENT_LOG_DIR / f"run_{int(run_id)}.lock"
+
+    @classmethod
+    def _acquire_enrichment_lock(cls, run_id: int, *, stale_after_minutes: int = 20) -> bool:
+        lock_path = cls._enrichment_lock_path(run_id)
+        if lock_path.exists():
+            try:
+                age = datetime.now() - datetime.fromtimestamp(lock_path.stat().st_mtime)
+                if age < timedelta(minutes=max(1, stale_after_minutes)):
+                    return False
+                lock_path.unlink(missing_ok=True)
+            except Exception:
+                return False
+
+        payload = {
+            "run_id": int(run_id),
+            "pid": os.getpid(),
+            "created_at": datetime.now().isoformat(),
+        }
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            return False
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+        return True
+
+    @classmethod
+    def _release_enrichment_lock(cls, run_id: int) -> None:
+        try:
+            cls._enrichment_lock_path(run_id).unlink(missing_ok=True)
+        except Exception:
+            pass
 
     def backfill_backtests(
         self,
@@ -980,50 +1023,47 @@ class StockPickerService:
         raise ValueError(f"unknown strategy_id: {target}")
 
     def _resolve_scan_trade_date(self) -> date:
-        if self.tushare_fetcher.is_available():
-            try:
-                trade_dates = self.tushare_fetcher._get_trade_dates()
-                if trade_dates:
-                    return datetime.strptime(trade_dates[0], "%Y%m%d").date()
-            except Exception as exc:
-                logger.warning("Stock picker failed to resolve Tushare trade date: %s", exc)
         latest_db_date = self._get_latest_daily_date()
         if latest_db_date is not None:
             return latest_db_date
         return date.today()
 
     def _load_mainboard_universe(self) -> List[Dict[str, str]]:
-        stock_list = None
-        if self.tushare_fetcher.is_available():
-            try:
-                stock_list = self.tushare_fetcher.get_stock_list()
-            except Exception as exc:
-                logger.warning("Stock picker failed to load universe from Tushare: %s", exc)
-
-        if stock_list is None or stock_list.empty:
-            try:
-                stock_list = BaostockFetcher().get_stock_list()
-            except Exception as exc:
-                logger.warning("Stock picker failed to load universe from Baostock: %s", exc)
-
-        if stock_list is None or stock_list.empty:
-            stock_list = self._load_universe_from_local_db()
-
-        if stock_list is None or stock_list.empty:
-            raise RuntimeError(
-                "unable to load A-share universe. Check Tushare token or local stock data availability."
-            )
         rows: List[Dict[str, str]] = []
-        for _, row in stock_list.iterrows():
-            code = str(row.get("code") or "").strip()
-            name = str(row.get("name") or "").strip()
-            if not code or not name:
-                continue
-            if not self._is_main_board_code(code):
-                continue
-            if self._is_st_name(name):
-                continue
-            rows.append({"code": code, "name": name})
+        tickflow_fetcher = self.fetcher_manager._get_tickflow_fetcher()
+        if tickflow_fetcher is not None:
+            try:
+                instruments = []
+                instruments.extend(tickflow_fetcher._get_client().exchanges.get_instruments("SH"))
+                instruments.extend(tickflow_fetcher._get_client().exchanges.get_instruments("SZ"))
+                for item in instruments:
+                    if str(item.get("type") or "").strip().lower() != "stock":
+                        continue
+                    code = str(item.get("code") or "").strip()
+                    name = str(item.get("name") or code).strip()
+                    if not code or not self._is_main_board_code(code) or self._is_st_name(name):
+                        continue
+                    rows.append({"code": code, "name": name})
+            except Exception as exc:
+                logger.warning("Stock picker failed to load universe from TickFlow exchanges: %s", exc)
+
+        if not rows:
+            stock_list = self._load_universe_from_local_db()
+            if stock_list is None or stock_list.empty:
+                try:
+                    stock_list = BaostockFetcher().get_stock_list()
+                except Exception as exc:
+                    logger.warning("Stock picker failed to load universe from Baostock: %s", exc)
+            if stock_list is None or stock_list.empty:
+                raise RuntimeError(
+                    "unable to load A-share universe from TickFlow exchanges, local database, or Baostock."
+                )
+            for _, row in stock_list.iterrows():
+                code = str(row.get("code") or "").strip()
+                name = str(row.get("name") or code).strip()
+                if not code or not self._is_main_board_code(code) or self._is_st_name(name):
+                    continue
+                rows.append({"code": code, "name": name})
         return rows
 
     @staticmethod
@@ -1042,10 +1082,15 @@ class StockPickerService:
         lookback_trading_days: int,
         force_refresh: bool = False,
     ) -> None:
-        if not force_refresh and self._has_sufficient_local_history_window(
-            scan_date,
-            minimum_codes=2000,
-            minimum_rows_per_code=min(lookback_trading_days, 60),
+        has_scan_snapshot = self._count_daily_rows(scan_date) >= 2500
+        if (
+            not force_refresh
+            and has_scan_snapshot
+            and self._has_sufficient_local_history_window(
+                scan_date,
+                minimum_codes=2000,
+                minimum_rows_per_code=min(lookback_trading_days, 60),
+            )
         ):
             logger.info("Stock picker reuses local daily snapshots for %s", scan_date)
             return
@@ -1058,46 +1103,7 @@ class StockPickerService:
         ):
             return
 
-        if not self.tushare_fetcher.is_available():
-            if self._has_sufficient_local_history_window(scan_date, minimum_codes=2000, minimum_rows_per_code=40):
-                logger.warning("Stock picker is using existing local history because Tushare is unavailable")
-                return
-            raise RuntimeError("TickFlow/Tushare are unavailable for full-market stock picker refresh")
-
-        try:
-            trade_dates = self.tushare_fetcher._get_trade_dates(end_date=scan_date.strftime("%Y%m%d"))[:lookback_trading_days]
-        except Exception as exc:
-            if self._has_recent_local_history(scan_date, minimum_codes=50):
-                logger.warning("Stock picker is using existing local history because Tushare trade dates failed: %s", exc)
-                return
-            raise RuntimeError(
-                f"Tushare token invalid or unavailable for stock picker refresh: {exc}"
-            ) from exc
-        if not trade_dates:
-            raise RuntimeError("failed to resolve trade dates for stock picker")
-
-        for trade_date in reversed(trade_dates):
-            target_date = datetime.strptime(trade_date, "%Y%m%d").date()
-            if not force_refresh and self._count_daily_rows(target_date) >= 2500:
-                continue
-            try:
-                df = self.tushare_fetcher._call_api_with_rate_limit("daily", trade_date=trade_date)
-            except Exception as exc:
-                if self._count_daily_rows(target_date) >= 50:
-                    logger.warning(
-                        "Stock picker reuses local daily snapshot for %s because Tushare refresh failed: %s",
-                        trade_date,
-                        exc,
-                    )
-                    continue
-                raise RuntimeError(
-                    f"Tushare token invalid or unavailable for stock picker daily snapshot {trade_date}: {exc}"
-                ) from exc
-            normalized = self._normalize_market_daily(df)
-            if normalized.empty:
-                logger.warning("Stock picker daily snapshot empty for %s", trade_date)
-                continue
-            self._save_market_daily_snapshot(normalized)
+        raise RuntimeError(f"TickFlow full-market refresh failed for {scan_date.isoformat()}")
 
     def _refresh_recent_market_data_with_tickflow(
         self,
@@ -1183,6 +1189,24 @@ class StockPickerService:
         with self.db.get_session() as session:
             value = session.execute(select(func.max(StockDaily.date))).scalar_one_or_none()
             return value
+
+    def _get_latest_complete_daily_date(
+        self,
+        *,
+        max_date: Optional[date] = None,
+        minimum_rows: int = 2500,
+    ) -> Optional[date]:
+        with self.db.get_session() as session:
+            query = (
+                select(StockDaily.date)
+                .group_by(StockDaily.date)
+                .having(func.count(StockDaily.id) >= minimum_rows)
+                .order_by(StockDaily.date.desc())
+            )
+            if max_date is not None:
+                query = query.where(StockDaily.date <= max_date)
+            value = session.execute(query.limit(1)).scalar_one_or_none()
+        return value
 
     def _load_universe_from_local_db(self) -> pd.DataFrame:
         with self.db.get_session() as session:
@@ -1628,8 +1652,12 @@ class StockPickerService:
         if self.search_service is None or not getattr(self.search_service, "is_available", False):
             return {"news_context": None, "news_score": 50.0, "from_cache": False}
 
+        executor: Optional[ThreadPoolExecutor] = None
         try:
-            intel_results = self.search_service.search_comprehensive_intel(code, name, max_searches=4)
+            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="picker_intel")
+            future = executor.submit(self.search_service.search_comprehensive_intel, code, name, 3)
+            intel_results = future.result(timeout=25)
+            executor.shutdown(wait=False, cancel_futures=True)
             self._save_candidate_intel_cache(
                 code=code,
                 name=name,
@@ -1644,7 +1672,18 @@ class StockPickerService:
                 "news_score": news_score,
                 "from_cache": False,
             }
+        except TimeoutError:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+            logger.warning("Stock picker intel collection timed out for %s", code)
+            return {"news_context": None, "news_score": 50.0, "from_cache": False}
         except Exception as exc:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
             logger.warning("Stock picker intel collection failed for %s: %s", code, exc)
             return {"news_context": None, "news_score": 50.0, "from_cache": False}
 
@@ -1959,6 +1998,33 @@ def _picker_build_stock_profile(self: StockPickerService, candidate: Dict[str, A
     )
 
 
+def _picker_compact_review_text(
+    self: StockPickerService,
+    *,
+    code: str,
+    name: str,
+    review_text: Optional[str],
+    max_chars: int = 420,
+) -> str:
+    raw = (review_text or "").strip()
+    if not raw:
+        return "未检索到高相关度新闻，按中性处理。"
+    keywords = {str(code or "").strip(), str(name or "").strip()}
+    kept: List[str] = []
+    for line in raw.splitlines():
+        clean = line.strip(" -\t")
+        if not clean:
+            continue
+        if any(keyword and keyword in clean for keyword in keywords):
+            kept.append(clean)
+        elif clean.startswith(("公司公告", "最新消息", "机构分析", "风险排查")):
+            kept.append(clean)
+        if sum(len(item) for item in kept) >= max_chars:
+            break
+    compact = "\n".join(kept).strip() or raw[:max_chars].strip()
+    return compact[:max_chars]
+
+
 def _picker_is_action_plan_usable(text: Optional[str]) -> bool:
     content = (text or "").strip()
     if len(content) < 180:
@@ -2025,27 +2091,26 @@ def _picker_build_action_plan(
     review_payload: Optional[Dict[str, Any]],
 ) -> tuple[str, Optional[str]]:
     review_text = review_payload.get("news_context") if isinstance(review_payload, dict) else None
-    trade_levels = self._derive_trade_levels(candidate)
-    stock_profile = self._build_stock_profile(candidate)
-    fallback = self._build_template_action_plan(
-        candidate=candidate,
-        strategy=strategy,
-        market_snapshot=market_snapshot,
-        us_snapshot=us_snapshot,
+    compact_review_text = self._picker_compact_review_text(
+        code=str(candidate.get("code") or ""),
+        name=str(candidate.get("name") or ""),
         review_text=review_text,
     )
+    trade_levels = self._derive_trade_levels(candidate)
+    stock_profile = self._build_stock_profile(candidate)
     if not getattr(self.analyzer, "is_available", lambda: False)():
-        return fallback, None
+        raise RuntimeError("LLM analyzer is unavailable")
 
     prompt = (
         "你是 A 股收盘后波段交易助手。请根据下面这只股票的量化数据、均线形态、波动特征、支撑压力位和新闻摘要，"
-        "生成一份面向第二天的操作手册。必须说清楚挂什么价格买、挂什么价格卖，并且要体现这只股票自己的历史特征。"
+        "生成一份面向第二天的精简操作手册。必须说清楚挂什么价格买、挂什么价格卖，并且要体现这只股票自己的历史特征。"
         "\n\n输出要求：\n"
         "1. 只能用中文。\n"
         "2. 必须输出以下标题：一、个股画像；二、入场前提；三、三种开盘预案；四、挂单计划；五、持仓与卖出；六、风险点。\n"
         "3. 挂单计划里必须出现具体价格：低吸挂单价、接力挂单价、突破追价、首次减仓价、止盈价、止损价、放弃价。\n"
         "4. 不能写成泛化模板，必须解释该股的均线结构、量能、波动率、支撑压力为何对应这些价格。\n"
         "5. 不能编造未给出的基本面或新闻。\n\n"
+        "6. 每个标题下最多写 3 个要点，整份手册尽量控制在 700 字左右，避免空话和重复。\n\n"
         f"策略：{strategy['name']}\n"
         f"股票：{candidate['name']} ({candidate['code']})\n"
         f"形态：{candidate.get('setup_type')}\n"
@@ -2057,17 +2122,74 @@ def _picker_build_action_plan(
         f"美股情绪：{us_snapshot.get('summary') or us_snapshot.get('mood') or '中性'}\n"
         f"价格参考：低吸 {trade_levels['buy_low']}，接力 {trade_levels['buy_high']}，突破 {trade_levels['breakout_buy']}，"
         f"减仓 {trade_levels['reduce_price']}，止盈 {trade_levels['take_profit']}，止损 {trade_levels['stop_loss']}，放弃 {trade_levels['abandon_price']}\n"
-        f"消息摘要：{review_text or '暂无额外高置信新闻，按中性处理。'}"
+        f"消息摘要：{compact_review_text}"
     )
-    generated = self.analyzer.generate_text(
-        prompt,
-        max_tokens=1400,
-        temperature=0.35,
-        timeout_seconds=25,
+    retry_prompt = (
+        "按下面固定骨架重写，禁止省略标题，禁止解释过程，禁止写套话。\n"
+        "输出骨架：\n"
+        "一、个股画像\n"
+        "二、入场前提\n"
+        "三、三种开盘预案\n"
+        "四、挂单计划\n"
+        "五、持仓与卖出\n"
+        "六、风险点\n\n"
+        "挂单计划必须逐行写出：\n"
+        f"低吸挂单价：{trade_levels['buy_low']}\n"
+        f"接力挂单价：{trade_levels['buy_high']}\n"
+        f"突破追价：{trade_levels['breakout_buy']}\n"
+        f"首次减仓价：{trade_levels['reduce_price']}\n"
+        f"止盈价：{trade_levels['take_profit']}\n"
+        f"止损价：{trade_levels['stop_loss']}\n"
+        f"放弃价：{trade_levels['abandon_price']}\n\n"
+        "必须结合该股均线、近10日波动、支撑压力和消息摘要说明这些价格为什么这样定。\n\n"
+        f"{prompt}"
     )
-    if not _picker_is_action_plan_usable(generated):
-        return fallback, None
-    return generated, getattr(self.config, "litellm_model", None)
+
+    def generate_once(prompt_text: str, *, max_tokens: int, temperature: float) -> str:
+        primary_model = str(getattr(self.config, "litellm_model", "") or "")
+        if primary_model.startswith("openai/"):
+            generated, _usage = self.analyzer._call_openai_responses_stream_fallback(
+                model=primary_model,
+                prompt=prompt_text,
+                system_prompt=self.analyzer.TEXT_SYSTEM_PROMPT,
+                config=self.config,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                timeout_seconds=75,
+            )
+        else:
+            result = self.analyzer._call_litellm(
+                prompt_text,
+                {
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "timeout_seconds": 75,
+                },
+                stream=True,
+            )
+            generated = result[0] if isinstance(result, tuple) else result
+        return str(generated or "").strip()
+
+    attempts = (
+        (prompt, 900, 0.25),
+        (retry_prompt, 950, 0.1),
+    )
+    last_error: Optional[Exception] = None
+    last_output = ""
+    for prompt_text, max_tokens, temperature in attempts:
+        try:
+            generated = generate_once(prompt_text, max_tokens=max_tokens, temperature=temperature)
+            last_output = generated
+            if _picker_is_action_plan_usable(generated):
+                return generated, getattr(self.config, "litellm_model", None)
+        except Exception as exc:
+            last_error = exc
+            logger.warning("Stock picker LLM action plan generation failed for %s: %s", candidate.get("code"), exc)
+            continue
+
+    if last_error is not None:
+        raise RuntimeError(f"LLM generation failed: {last_error}") from last_error
+    raise RuntimeError(f"LLM generation returned unusable action plan: {last_output[:120]}")
 
 
 def _picker_build_run_summary_markdown(
@@ -2429,23 +2551,42 @@ def _picker_load_universe_from_local_db(self: StockPickerService) -> pd.DataFram
 
 def _picker_resolve_scan_trade_date(self: StockPickerService) -> date:
     today = date.today()
-    if self.tushare_fetcher.is_available():
+    tickflow_fetcher = self.fetcher_manager._get_tickflow_fetcher()
+    if tickflow_fetcher is not None and hasattr(tickflow_fetcher, "get_daily_batch"):
         try:
-            trade_dates = self.tushare_fetcher._get_trade_dates(end_date=today.strftime("%Y%m%d"))
-            if trade_dates:
-                return datetime.strptime(trade_dates[0], "%Y%m%d").date()
+            frames = tickflow_fetcher.get_daily_batch(
+                ["000001", "600519", "601318"],
+                count=2,
+                end_date=today.strftime("%Y-%m-%d"),
+            )
+            available_dates: List[date] = []
+            for frame in frames.values():
+                if frame is None or frame.empty or "date" not in frame.columns:
+                    continue
+                latest = pd.to_datetime(frame["date"]).dt.date.max()
+                if latest is not None:
+                    available_dates.append(latest)
+            if available_dates:
+                return max(available_dates)
         except Exception as exc:
-            logger.warning("Stock picker failed to resolve Tushare trade date: %s", exc)
+            logger.warning("Stock picker failed to resolve TickFlow trade date: %s", exc)
 
-    latest_db_date = self._get_latest_daily_date()
-    if latest_db_date is not None and latest_db_date <= today:
-        return latest_db_date
+    try:
+        effective = get_effective_trading_date("cn")
+    except Exception as exc:
+        logger.warning("Stock picker failed to resolve effective CN trade date from calendar: %s", exc)
+        effective = today
+
+    latest_complete = self._get_latest_complete_daily_date(max_date=effective)
+    if latest_complete is not None:
+        return latest_complete
 
     if today.weekday() == 5:
         return today - timedelta(days=1)
     if today.weekday() == 6:
         return today - timedelta(days=2)
-    return today
+
+    return effective
 
 
 def _picker_is_reusable_run_payload(self: StockPickerService, payload: Optional[Dict[str, Any]]) -> bool:
@@ -2554,20 +2695,12 @@ def _picker_build_notification_markdown(self: StockPickerService, payload: Dict[
     market_snapshot = payload.get("market_snapshot") or {}
     us_snapshot = payload.get("us_market_snapshot") or {}
     candidates = (payload.get("candidates") or [])[:_MAX_REPORT_CANDIDATES]
-    stage = str(payload.get("notification_stage") or "initial").strip().lower()
-    stage_label = "增强版" if stage == "enhanced" else "模板版"
-    stage_note = (
-        "已补充新闻复核和 LLM 个股化操作手册。"
-        if stage == "enhanced"
-        else "先发模板版手册，新闻和 LLM 增强完成后会再次补发。"
-    )
-
     lines = [
-        f"# {scan_date} 收盘后选股 {stage_label}",
+        f"# {scan_date} 收盘后选股最终版",
         "",
         f"- 策略：{strategy_name}",
         "- 范围：沪深主板（非 ST）",
-        f"- 说明：{stage_note}",
+        "- 说明：已完成新闻复核与 LLM 个股化操作手册生成。",
         f"- A股情绪：{market_snapshot.get('summary') or market_snapshot.get('regime') or '中性'}",
         f"- 美股情绪：{us_snapshot.get('summary') or us_snapshot.get('mood') or '中性'}",
         f"- 扫描结果：入选 {payload.get('selected_count', 0)} / 命中 {payload.get('matched_count', 0)} / 扫描 {payload.get('total_scanned', 0)}",
@@ -2610,6 +2743,7 @@ StockPickerService._to_float = _picker_to_float
 StockPickerService._score_intel_payload = _picker_score_intel_payload
 StockPickerService._derive_trade_levels = _picker_derive_trade_levels
 StockPickerService._build_stock_profile = _picker_build_stock_profile
+StockPickerService._picker_compact_review_text = _picker_compact_review_text
 StockPickerService._build_template_action_plan = _picker_build_template_action_plan
 StockPickerService._build_action_plan = _picker_build_action_plan
 StockPickerService._build_run_summary_markdown = _picker_build_run_summary_markdown

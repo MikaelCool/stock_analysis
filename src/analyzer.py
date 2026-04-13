@@ -1046,6 +1046,7 @@ class GeminiAnalyzer:
         config: Config,
         max_tokens: int,
         temperature: float,
+        timeout_seconds: Optional[float] = None,
         progress_callback: Optional[Callable[[int], None]] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """Fallback for gateways that only return text correctly via /responses streaming."""
@@ -1057,7 +1058,7 @@ class GeminiAnalyzer:
         if not api_key or not api_base:
             raise ValueError("responses fallback requires api_key and api_base")
 
-        client = OpenAI(api_key=api_key, base_url=api_base)
+        client = OpenAI(api_key=api_key, base_url=api_base, timeout=timeout_seconds)
         chunks: List[str] = []
         usage: Dict[str, Any] = {}
         chars_received = 0
@@ -1227,6 +1228,7 @@ class GeminiAnalyzer:
             or 8192
         )
         temperature = generation_config.get('temperature', 0.7)
+        timeout_seconds = generation_config.get("timeout_seconds")
 
         models_to_try = [config.litellm_model] + (config.litellm_fallback_models or [])
         models_to_try = [m for m in models_to_try if m]
@@ -1248,6 +1250,8 @@ class GeminiAnalyzer:
                     "temperature": temperature,
                     "max_tokens": max_tokens,
                 }
+                if timeout_seconds is not None:
+                    call_kwargs["timeout"] = timeout_seconds
                 extra = get_thinking_extra_body(model_short)
                 if extra:
                     call_kwargs["extra_body"] = extra
@@ -1311,6 +1315,7 @@ class GeminiAnalyzer:
                         config=config,
                         max_tokens=max_tokens,
                         temperature=temperature,
+                        timeout_seconds=timeout_seconds,
                         progress_callback=stream_progress_callback,
                     )
                     return response_text, model, usage
@@ -1328,6 +1333,7 @@ class GeminiAnalyzer:
         prompt: str,
         max_tokens: int = 2048,
         temperature: float = 0.7,
+        timeout_seconds: Optional[float] = None,
     ) -> Optional[str]:
         """Public entry point for free-form text generation.
 
@@ -1346,7 +1352,11 @@ class GeminiAnalyzer:
         try:
             result = self._call_litellm(
                 prompt,
-                generation_config={"max_tokens": max_tokens, "temperature": temperature},
+                generation_config={
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "timeout_seconds": timeout_seconds,
+                },
             )
             if isinstance(result, tuple):
                 text, model_used, usage = result

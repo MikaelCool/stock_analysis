@@ -415,7 +415,7 @@ class StockSelectionRun(Base):
     optimization_snapshot_json = Column(Text)
     summary_markdown = Column(Text)
     created_at = Column(DateTime, default=datetime.now, index=True)
-    completed_at = Column(DateTime, default=datetime.now, index=True)
+    completed_at = Column(DateTime, nullable=True, index=True)
 
     __table_args__ = (
         Index('ix_stock_selection_strategy_date', 'strategy_id', 'scan_date'),

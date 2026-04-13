@@ -1252,7 +1252,14 @@ class DataFetcherManager:
             logger.error(f"[预取] 批量预取异常: {e}")
             return 0
     
-    def get_realtime_quote(self, stock_code: str, *, log_final_failure: bool = True, force_refresh: bool = False):
+    def get_realtime_quote(
+        self,
+        stock_code: str,
+        *,
+        log_final_failure: bool = True,
+        force_refresh: bool = False,
+        allow_supplement: bool = True,
+    ):
         """
         获取实时行情数据（自动故障切换）
         
@@ -1343,6 +1350,7 @@ class DataFetcherManager:
         source_priority = config.realtime_source_priority.split(',')
         
         errors = []
+        supplement_attempts = 0
         # primary_quote holds the first successful result; we may supplement
         # missing fields (volume_ratio, turnover_rate, etc.) from later sources.
         primary_quote = None
@@ -1354,7 +1362,7 @@ class DataFetcherManager:
                     if quote is not None and quote.has_basic_data():
                         primary_quote = quote
                         logger.info(f"[实时行情] {stock_code} 成功获取 (来源: tickflow)")
-                        if not self._quote_needs_supplement(primary_quote):
+                        if not allow_supplement or not self._quote_needs_supplement(primary_quote):
                             self._write_snapshot_cache(
                                 "realtime",
                                 cache_key,
@@ -1419,7 +1427,7 @@ class DataFetcherManager:
                         primary_quote = quote
                         logger.info(f"[实时行情] {stock_code} 成功获取 (来源: {source})")
                         # If all key supplementary fields are present, return early
-                        if not self._quote_needs_supplement(primary_quote):
+                        if not allow_supplement or not self._quote_needs_supplement(primary_quote):
                             return primary_quote
                         # Otherwise, continue to try later sources for missing fields
                         logger.debug(f"[实时行情] {stock_code} 部分字段缺失，尝试从后续数据源补充")

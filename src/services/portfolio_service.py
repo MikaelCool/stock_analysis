@@ -996,6 +996,7 @@ class PortfolioService:
                         symbol,
                         log_final_failure=False,
                         force_refresh=True,
+                        allow_supplement=False,
                     )
                     if quote is not None and quote.has_basic_data():
                         price = float(getattr(quote, "price", 0.0) or 0.0)

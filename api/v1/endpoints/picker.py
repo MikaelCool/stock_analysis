@@ -32,7 +32,7 @@ class PickerScanRequest(BaseModel):
     scan_date: Optional[date] = None
     max_candidates: Optional[int] = Field(default=None, ge=1, le=10)
     strategy_params: Dict[str, Any] = Field(default_factory=dict)
-    send_notification: bool = False
+    send_notification: bool = True
     force_refresh: bool = False
 
 

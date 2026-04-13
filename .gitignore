@@ -1,10 +1,14 @@
-# Secrets and local overrides
+# 环境变量文件（包含敏感信息，禁止提交）
 .env
 .env.*
-!.env.example
 *.env
 *.env.local
-*.local
+.env.*.local
+
+# 测试文件（可能包含敏感配置）
+# 仅忽略仓库根目录下的临时 test_*.py 脚本；tests/ 目录下的单元测试需要纳入版本控制。
+/test_*.py
+!test_env.py
 
 # Python
 __pycache__/
@@ -12,44 +16,29 @@ __pycache__/
 *$py.class
 *.so
 .Python
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-.coverage.*
-htmlcov/
 build/
+develop-eggs/
 dist/
-site/
-*.egg-info/
+downloads/
+eggs/
 .eggs/
-pip-wheel-metadata/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# Virtual environments
-.venv/
+# 虚拟环境
 venv/
-env/
 ENV/
+env/
+.venv/
 
-# Node / frontend
-node_modules/
-apps/dsa-web/node_modules/
-apps/dsa-desktop/node_modules/
-apps/dsa-desktop/dist/
-
-# Runtime data
-data/
-logs/
-reports/
-tmp/
-temp/
-*.db
-*.sqlite
-*.sqlite3
-web_stdout.log
-web_stderr.log
-
-# IDE / editor
+# IDE
 .idea/
 .vscode/
 *.swp
@@ -57,21 +46,35 @@ web_stderr.log
 *~
 .cursorrules
 
-# OS files
+# 数据和日志
+/data/
+logs/
+reports/
+*.db
+*.sqlite
+*.sqlite3
+
+# 系统文件
 .DS_Store
 Thumbs.db
-desktop.ini
 
-# Local scripts and ad-hoc verification
-/test_*.py
-!test_env.py
-verify_*.py
+# 测试
+.pytest_cache/
+.coverage
+htmlcov/
+
 local/
 
-# Claude / local assistant artifacts
+run.sh
+
+verify_*.py
+
+# ignore Claude workspace artifacts, but keep shared repo skills versioned
 .claude/*
 !.claude/skills/
 !.claude/skills/**
 
-# Static export artifacts
+# ignore static files
 static/
+/apps/dsa-desktop/dist/
+/apps/dsa-desktop/node_modules/

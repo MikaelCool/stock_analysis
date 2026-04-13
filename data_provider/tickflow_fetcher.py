@@ -141,7 +141,11 @@ class TickFlowFetcher(BaseFetcher):
         if "trade_date" in normalized.columns:
             normalized = normalized.rename(columns={"trade_date": "date"})
         elif "timestamp" in normalized.columns:
-            normalized["date"] = pd.to_datetime(normalized["timestamp"], unit="ms").dt.strftime("%Y-%m-%d")
+            normalized["date"] = (
+                pd.to_datetime(normalized["timestamp"], unit="ms", utc=True)
+                .dt.tz_convert("Asia/Shanghai")
+                .dt.strftime("%Y-%m-%d")
+            )
         else:
             raise DataFetchError("TickFlow kline response missing trade_date/timestamp")
 
