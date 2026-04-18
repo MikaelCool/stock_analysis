@@ -656,6 +656,8 @@ class Config:
     stock_picker_max_candidates: int = 10
     stock_picker_llm_review_limit: int = 5
     stock_picker_schedule_time: str = "16:00"
+    stock_picker_optimization_schedule_enabled: bool = True
+    stock_picker_optimization_schedule_time: str = "16:20"
     
     # === 日志配置 ===
     log_dir: str = "./logs"  # 日志文件目录
@@ -1316,6 +1318,30 @@ class Config:
                 2.0,
                 field_name='BACKTEST_NEUTRAL_BAND_PCT',
                 minimum=0.0,
+            ),
+            stock_picker_enabled=os.getenv('STOCK_PICKER_ENABLED', 'true').lower() == 'true',
+            stock_picker_schedule_enabled=os.getenv('STOCK_PICKER_SCHEDULE_ENABLED', 'true').lower() == 'true',
+            stock_picker_default_strategy=os.getenv('STOCK_PICKER_DEFAULT_STRATEGY', 'mainboard_swing_master'),
+            stock_picker_max_candidates=parse_env_int(
+                os.getenv('STOCK_PICKER_MAX_CANDIDATES'),
+                10,
+                field_name='STOCK_PICKER_MAX_CANDIDATES',
+                minimum=1,
+            ),
+            stock_picker_llm_review_limit=parse_env_int(
+                os.getenv('STOCK_PICKER_LLM_REVIEW_LIMIT'),
+                5,
+                field_name='STOCK_PICKER_LLM_REVIEW_LIMIT',
+                minimum=1,
+            ),
+            stock_picker_schedule_time=os.getenv('STOCK_PICKER_SCHEDULE_TIME', '16:00'),
+            stock_picker_optimization_schedule_enabled=os.getenv(
+                'STOCK_PICKER_OPTIMIZATION_SCHEDULE_ENABLED',
+                'true',
+            ).lower() == 'true',
+            stock_picker_optimization_schedule_time=os.getenv(
+                'STOCK_PICKER_OPTIMIZATION_SCHEDULE_TIME',
+                '16:20',
             ),
             log_dir=os.getenv('LOG_DIR', './logs'),
             log_level=os.getenv('LOG_LEVEL', 'INFO'),

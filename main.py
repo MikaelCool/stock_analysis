@@ -784,10 +784,69 @@ def _build_stock_picker_schedule_checker():
     return _checker
 
 
+def _build_stock_picker_optimization_checker():
+    state = {"last_trigger_key": ""}
+
+    def _checker() -> None:
+        runtime_config = _reload_runtime_config()
+        if not getattr(runtime_config, "stock_picker_enabled", True):
+            return
+        if not getattr(runtime_config, "stock_picker_optimization_schedule_enabled", True):
+            return
+
+        schedule_time = (
+            getattr(runtime_config, "stock_picker_optimization_schedule_time", "16:20") or "16:20"
+        ).strip() or "16:20"
+        try:
+            datetime.strptime(schedule_time, "%H:%M")
+        except Exception:
+            schedule_time = "16:20"
+
+        from src.core.trading_calendar import get_market_now
+        from src.services.stock_picker_service import StockPickerService
+
+        now = get_market_now("cn")
+        today = now.date()
+        picker = StockPickerService(config=runtime_config)
+        effective_trade_date = picker._resolve_scan_trade_date()
+
+        # 周五收盘后触发一次；周末再次补跑一次，确保服务在周末启动时也会完成优化。
+        if today.weekday() < 5:
+            if today.weekday() != 4:
+                return
+            if effective_trade_date != today:
+                return
+
+        schedule_hour, schedule_minute = (int(part) for part in schedule_time.split(":", 1))
+        scheduled_at = now.replace(hour=schedule_hour, minute=schedule_minute, second=0, microsecond=0)
+        if now < scheduled_at:
+            return
+
+        trigger_key = f"picker_opt@{today.isoformat()}@{effective_trade_date.isoformat()}@{schedule_time}"
+        if state["last_trigger_key"] == trigger_key:
+            return
+
+        logger.info(
+            "触发周度选股优化任务: effective_trade_date=%s schedule_time=%s",
+            effective_trade_date,
+            schedule_time,
+        )
+        result = picker.run_weekly_optimization(lookback_days=90, max_candidates=3000)
+        logger.info(
+            "周度选股优化完成: backtest=%s strategies=%s",
+            result.get("backtest_stats"),
+            len(result.get("strategies") or []),
+        )
+        state["last_trigger_key"] = trigger_key
+
+    return _checker
+
+
 def start_stock_picker_schedule_background() -> None:
     import threading
 
     checker = _build_stock_picker_schedule_checker()
+    optimization_checker = _build_stock_picker_optimization_checker()
 
     def _runner() -> None:
         while True:
@@ -795,11 +854,19 @@ def start_stock_picker_schedule_background() -> None:
                 checker()
             except Exception as exc:
                 logger.warning("后台定时选股检查失败: %s", exc)
+            try:
+                optimization_checker()
+            except Exception as exc:
+                logger.warning("后台周度优化检查失败: %s", exc)
             time.sleep(30)
 
     thread = threading.Thread(target=_runner, daemon=True, name="stock-picker-schedule")
     thread.start()
-    logger.info("收盘后选股后台调度已启动，默认执行时间: %s", getattr(get_config(), "stock_picker_schedule_time", "16:00"))
+    logger.info(
+        "收盘后选股后台调度已启动，默认执行时间: %s；周度优化时间: %s",
+        getattr(get_config(), "stock_picker_schedule_time", "16:00"),
+        getattr(get_config(), "stock_picker_optimization_schedule_time", "16:20"),
+    )
 
 
 def main() -> int:

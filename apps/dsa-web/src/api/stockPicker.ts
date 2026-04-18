@@ -82,6 +82,94 @@ export interface PickerScanRequest {
   forceRefresh?: boolean;
 }
 
+export interface PickerStrategyDistributionItem {
+  strategyId: string;
+  strategyName: string;
+  totalEvaluations: number;
+  pendingCount: number;
+  completedCount: number;
+  winCount: number;
+  lossCount: number;
+  neutralCount: number;
+  winRatePct?: number | null;
+  avgReturnPct?: number | null;
+  avgMaxDrawdownPct?: number | null;
+  worstDrawdownPct?: number | null;
+}
+
+export interface PickerSetupTypeDistributionItem {
+  setupType: string;
+  totalEvaluations: number;
+  pendingCount: number;
+  completedCount: number;
+  winCount: number;
+  lossCount: number;
+  neutralCount: number;
+  winRatePct?: number | null;
+  avgReturnPct?: number | null;
+  avgMaxDrawdownPct?: number | null;
+  worstDrawdownPct?: number | null;
+}
+
+export interface PickerBacktestSummary {
+  strategyId?: string | null;
+  strategyName?: string | null;
+  horizonDays: number;
+  topN: number;
+  totalEvaluations: number;
+  pendingCount: number;
+  completedCount: number;
+  winCount: number;
+  lossCount: number;
+  neutralCount: number;
+  winRatePct?: number | null;
+  avgReturnPct?: number | null;
+  avgMaxDrawdownPct?: number | null;
+  worstDrawdownPct?: number | null;
+  scanCount: number;
+  stockCount: number;
+  latestScanDate?: string | null;
+  strategyDistribution: PickerStrategyDistributionItem[];
+  setupTypeDistribution: PickerSetupTypeDistributionItem[];
+}
+
+export interface PickerBacktestResultItem {
+  id: number;
+  candidateId: number;
+  runId: number;
+  strategyId: string;
+  strategyName: string;
+  code: string;
+  name?: string | null;
+  scanDate?: string | null;
+  rank: number;
+  score: number;
+  setupType: string;
+  horizonDays: number;
+  status: string;
+  entryDate?: string | null;
+  exitDate?: string | null;
+  entryPrice?: number | null;
+  exitPrice?: number | null;
+  returnPct?: number | null;
+  maxDrawdownPct?: number | null;
+  outcome?: string | null;
+}
+
+export interface PickerBacktestResultsResponse {
+  total: number;
+  page: number;
+  limit: number;
+  items: PickerBacktestResultItem[];
+}
+
+export interface PickerBacktestRunResponse {
+  processed: number;
+  completed: number;
+  pending: number;
+  summary: PickerBacktestSummary;
+}
+
 function toCamel<T>(value: unknown): T {
   if (Array.isArray(value)) {
     return value.map((item) => toCamel(item)) as T;
@@ -125,5 +213,59 @@ export const stockPickerApi = {
       force_refresh: payload.forceRefresh ?? false,
     });
     return toCamel<PickerRun>(response.data);
+  },
+  async getBacktestSummary(params: {
+    strategyId?: string;
+    horizonDays?: number;
+    scanDateFrom?: string;
+    scanDateTo?: string;
+    topN?: number;
+  } = {}): Promise<PickerBacktestSummary> {
+    const response = await apiClient.get('/api/v1/picker/backtest/summary', {
+      params: {
+        strategy_id: params.strategyId,
+        horizon_days: params.horizonDays,
+        scan_date_from: params.scanDateFrom,
+        scan_date_to: params.scanDateTo,
+        top_n: params.topN,
+      },
+    });
+    return toCamel<PickerBacktestSummary>(response.data);
+  },
+  async getBacktestResults(params: {
+    strategyId?: string;
+    horizonDays?: number;
+    scanDateFrom?: string;
+    scanDateTo?: string;
+    topN?: number;
+    page?: number;
+    limit?: number;
+  } = {}): Promise<PickerBacktestResultsResponse> {
+    const response = await apiClient.get('/api/v1/picker/backtest/results', {
+      params: {
+        strategy_id: params.strategyId,
+        horizon_days: params.horizonDays,
+        scan_date_from: params.scanDateFrom,
+        scan_date_to: params.scanDateTo,
+        top_n: params.topN,
+        page: params.page ?? 1,
+        limit: params.limit ?? 30,
+      },
+    });
+    return toCamel<PickerBacktestResultsResponse>(response.data);
+  },
+  async runBacktestRefresh(payload: {
+    strategyId?: string;
+    horizonDays?: number;
+    topN?: number;
+    maxCandidates?: number;
+  } = {}): Promise<PickerBacktestRunResponse> {
+    const response = await apiClient.post('/api/v1/picker/backtest/run', {
+      strategy_id: payload.strategyId,
+      horizon_days: payload.horizonDays ?? 5,
+      top_n: payload.topN ?? 5,
+      max_candidates: payload.maxCandidates ?? 2000,
+    });
+    return toCamel<PickerBacktestRunResponse>(response.data);
   },
 };

@@ -12,6 +12,7 @@ import sys
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
+from copy import copy
 from dataclasses import dataclass
 from datetime import date, datetime, time as dt_time, timedelta
 from pathlib import Path
@@ -55,6 +56,9 @@ _PICKER_STRATEGY_PRESETS: Dict[str, Dict[str, Any]] = {
             "min_score_threshold": 72.0,
             "volume_spike_multiplier": 1.6,
             "max_ma20_distance_pct": 4.0,
+            "max_ma5_distance_pct": 2.0,
+            "market_score_floor": 50.0,
+            "preferred_setup_type": "",
         },
     },
     "bull_trend": {
@@ -64,6 +68,9 @@ _PICKER_STRATEGY_PRESETS: Dict[str, Dict[str, Any]] = {
             "min_score_threshold": 70.0,
             "volume_spike_multiplier": 1.4,
             "max_ma20_distance_pct": 4.0,
+            "max_ma5_distance_pct": 2.0,
+            "market_score_floor": 48.0,
+            "preferred_setup_type": "pullback",
         },
     },
     "ma_golden_cross": {
@@ -73,6 +80,9 @@ _PICKER_STRATEGY_PRESETS: Dict[str, Dict[str, Any]] = {
             "min_score_threshold": 70.0,
             "volume_spike_multiplier": 1.6,
             "max_ma20_distance_pct": 3.5,
+            "max_ma5_distance_pct": 2.2,
+            "market_score_floor": 50.0,
+            "preferred_setup_type": "breakout",
         },
     },
     "shrink_pullback": {
@@ -82,6 +92,9 @@ _PICKER_STRATEGY_PRESETS: Dict[str, Dict[str, Any]] = {
             "min_score_threshold": 68.0,
             "volume_spike_multiplier": 1.5,
             "max_ma20_distance_pct": 4.0,
+            "max_ma5_distance_pct": 2.0,
+            "market_score_floor": 48.0,
+            "preferred_setup_type": "pullback",
         },
     },
     "volume_breakout": {
@@ -91,6 +104,9 @@ _PICKER_STRATEGY_PRESETS: Dict[str, Dict[str, Any]] = {
             "min_score_threshold": 72.0,
             "volume_spike_multiplier": 2.0,
             "max_ma20_distance_pct": 5.0,
+            "max_ma5_distance_pct": 2.5,
+            "market_score_floor": 52.0,
+            "preferred_setup_type": "breakout",
         },
     },
     "dragon_head": {
@@ -228,6 +244,9 @@ class StockPickerService:
                     "min_score_threshold": 75.0,
                     "volume_spike_multiplier": 1.8,
                     "max_ma20_distance_pct": 3.0,
+                    "max_ma5_distance_pct": 2.0,
+                    "market_score_floor": 50.0,
+                    "preferred_setup_type": "",
                 },
             ),
             StrategyDefinition(
@@ -240,6 +259,9 @@ class StockPickerService:
                     "min_score_threshold": 70.0,
                     "volume_spike_multiplier": 1.6,
                     "max_ma20_distance_pct": 3.5,
+                    "max_ma5_distance_pct": 2.2,
+                    "market_score_floor": 50.0,
+                    "preferred_setup_type": "breakout",
                 },
             ),
             StrategyDefinition(
@@ -252,6 +274,9 @@ class StockPickerService:
                     "min_score_threshold": 68.0,
                     "volume_spike_multiplier": 1.5,
                     "max_ma20_distance_pct": 4.0,
+                    "max_ma5_distance_pct": 2.0,
+                    "market_score_floor": 48.0,
+                    "preferred_setup_type": "pullback",
                 },
             ),
             StrategyDefinition(
@@ -264,6 +289,9 @@ class StockPickerService:
                     "min_score_threshold": 72.0,
                     "volume_spike_multiplier": 2.0,
                     "max_ma20_distance_pct": 5.0,
+                    "max_ma5_distance_pct": 2.5,
+                    "market_score_floor": 52.0,
+                    "preferred_setup_type": "breakout",
                 },
             ),
         ]
@@ -611,7 +639,14 @@ class StockPickerService:
             enriched_updates: Dict[int, Dict[str, Any]] = {}
             report_candidates = candidate_records[: max(0, llm_review_limit)]
             if report_candidates:
-                worker_count = min(max(1, len(report_candidates)), 3)
+                primary_model = str(getattr(service.config, "litellm_model", "") or "")
+                # The GPT-5.4 gateway is unstable under concurrent streamed /responses calls.
+                # Keep picker handbook generation serial on OpenAI-compatible primaries and
+                # rely on per-candidate DeepSeek fallback instead of failing the whole run.
+                if primary_model.startswith("openai/"):
+                    worker_count = 1
+                else:
+                    worker_count = min(max(1, len(report_candidates)), 3)
                 with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="picker_enrich") as executor:
                     futures = {
                         executor.submit(enrich_candidate, candidate_payload): candidate_payload
@@ -809,44 +844,30 @@ class StockPickerService:
             if strategy_id:
                 conditions.append(StockSelectionCandidate.strategy_id == strategy_id)
 
-            existing_pairs = session.execute(
-                select(
-                    StockSelectionBacktest.candidate_id,
-                    StockSelectionBacktest.horizon_days,
-                )
-            ).all()
-            seen = {(candidate_id, horizon_days) for candidate_id, horizon_days in existing_pairs}
-
             query = select(StockSelectionCandidate)
             if conditions:
                 query = query.where(and_(*conditions))
             query = query.order_by(desc(StockSelectionCandidate.scan_date), StockSelectionCandidate.rank.asc()).limit(max_candidates)
             candidates = session.execute(query).scalars().all()
+            candidate_ids = [int(candidate.id) for candidate in candidates]
+
+            existing_rows: Dict[tuple[int, int], StockSelectionBacktest] = {}
+            if candidate_ids:
+                rows = session.execute(
+                    select(StockSelectionBacktest).where(StockSelectionBacktest.candidate_id.in_(candidate_ids))
+                ).scalars().all()
+                existing_rows = {
+                    (int(row.candidate_id), int(row.horizon_days)): row
+                    for row in rows
+                }
 
             to_insert: List[StockSelectionBacktest] = []
             for candidate in candidates:
                 bars = self._load_forward_bars(candidate.code, candidate.scan_date, max(BACKTEST_HORIZONS) + 1)
-                if len(bars) < 1:
-                    for horizon in BACKTEST_HORIZONS:
-                        if (candidate.id, horizon) in seen:
-                            continue
-                        pending += 1
-                        to_insert.append(
-                            StockSelectionBacktest(
-                                candidate_id=candidate.id,
-                                strategy_id=candidate.strategy_id,
-                                code=candidate.code,
-                                scan_date=candidate.scan_date,
-                                horizon_days=horizon,
-                                status="pending",
-                                created_at=datetime.now(),
-                                evaluated_at=datetime.now(),
-                            )
-                        )
-                    continue
 
                 for horizon in BACKTEST_HORIZONS:
-                    if (candidate.id, horizon) in seen:
+                    existing = existing_rows.get((int(candidate.id), int(horizon)))
+                    if existing is not None and str(existing.status or "").lower() == "completed":
                         continue
                     processed += 1
                     record = self._evaluate_candidate_horizon(candidate, bars, horizon)
@@ -854,6 +875,21 @@ class StockPickerService:
                         completed += 1
                     else:
                         pending += 1
+                    if existing is not None:
+                        existing.status = record["status"]
+                        existing.entry_date = record.get("entry_date")
+                        existing.exit_date = record.get("exit_date")
+                        existing.entry_price = record.get("entry_price")
+                        existing.exit_price = record.get("exit_price")
+                        existing.end_close = record.get("end_close")
+                        existing.max_high = record.get("max_high")
+                        existing.min_low = record.get("min_low")
+                        existing.return_pct = record.get("return_pct")
+                        existing.max_drawdown_pct = record.get("max_drawdown_pct")
+                        existing.outcome = record.get("outcome")
+                        existing.evaluated_at = datetime.now()
+                        continue
+
                     to_insert.append(
                         StockSelectionBacktest(
                             candidate_id=candidate.id,
@@ -879,6 +915,7 @@ class StockPickerService:
 
             if to_insert:
                 session.add_all(to_insert)
+            if to_insert or processed:
                 session.commit()
 
         return {
@@ -892,11 +929,12 @@ class StockPickerService:
         *,
         strategy_id: str,
         lookback_days: int = 90,
-        selected_horizon_days: int = 5,
+        selected_horizon_days: Optional[int] = 5,
     ) -> Dict[str, Any]:
         strategy = self._resolve_strategy(strategy_id)
         cutoff = date.today() - timedelta(days=lookback_days)
         candidate_rows: List[Dict[str, Any]] = []
+        horizons_to_try = [int(selected_horizon_days)] if selected_horizon_days else [3, 5, 10]
         with self.db.get_session() as session:
             rows = session.execute(
                 select(StockSelectionCandidate, StockSelectionBacktest)
@@ -908,7 +946,9 @@ class StockPickerService:
                     and_(
                         StockSelectionCandidate.strategy_id == strategy_id,
                         StockSelectionCandidate.scan_date >= cutoff,
-                        StockSelectionBacktest.horizon_days == selected_horizon_days,
+                        StockSelectionCandidate.selected.is_(True),
+                        StockSelectionCandidate.rank <= 5,
+                        StockSelectionBacktest.horizon_days.in_(horizons_to_try),
                         StockSelectionBacktest.status == "completed",
                     )
                 )
@@ -918,10 +958,22 @@ class StockPickerService:
                 metrics = self._safe_json_loads(candidate.indicator_snapshot_json)
                 if not isinstance(metrics, dict):
                     metrics = {}
+                market_context = self._safe_json_loads(candidate.market_context_json)
+                market_score = 50.0
+                if isinstance(market_context, dict):
+                    cn_ctx = market_context.get("cn")
+                    if isinstance(cn_ctx, dict):
+                        market_score = float(cn_ctx.get("score") or market_score)
                 candidate_rows.append(
                     {
                         "score": float(candidate.score or 0.0),
                         "distance_to_ma20_pct": float(metrics.get("distance_to_ma20_pct") or 999.0),
+                        "distance_to_ma5_pct": float(metrics.get("distance_to_ma5_pct") or 999.0),
+                        "volume_spike_factor": float(metrics.get("volume_spike_factor") or 0.0),
+                        "market_score": float(metrics.get("market_score") or market_score),
+                        "setup_type": str(candidate.setup_type or "mixed"),
+                        "horizon_days": int(backtest.horizon_days or 0),
+                        "max_drawdown_pct": float(backtest.max_drawdown_pct or 0.0),
                         "return_pct": float(backtest.return_pct or 0.0),
                     }
                 )
@@ -931,7 +983,7 @@ class StockPickerService:
                     "strategy_id": strategy_id,
                     "strategy_name": strategy["name"],
                     "lookback_days": lookback_days,
-                    "selected_horizon_days": selected_horizon_days,
+                    "selected_horizon_days": int(selected_horizon_days or 5),
                     "status": "insufficient_data",
                     "params": dict(strategy["params"]),
                     "metrics": {"sample_count": 0},
@@ -941,7 +993,7 @@ class StockPickerService:
                         strategy_id=strategy_id,
                         strategy_name=strategy["name"],
                         lookback_days=lookback_days,
-                        selected_horizon_days=selected_horizon_days,
+                        selected_horizon_days=int(selected_horizon_days or 5),
                         metrics_json=json.dumps(payload["metrics"], ensure_ascii=False),
                         params_json=json.dumps(payload["params"], ensure_ascii=False),
                         status="insufficient_data",
@@ -953,45 +1005,84 @@ class StockPickerService:
 
             best_score = -10**9
             best_payload = None
-            for min_score_threshold in (65.0, 70.0, 75.0, 80.0):
-                for max_ma20_distance_pct in (1.5, 2.5, 3.5, 4.5):
-                    filtered = [
-                        row for row in candidate_rows
-                        if row["score"] >= min_score_threshold
-                        and row["distance_to_ma20_pct"] <= max_ma20_distance_pct
-                    ]
-                    if len(filtered) < 6:
-                        continue
-                    avg_return = sum(row["return_pct"] for row in filtered) / len(filtered)
-                    win_rate = sum(1 for row in filtered if row["return_pct"] > 0) / len(filtered)
-                    objective = avg_return * 0.75 + win_rate * 15.0
-                    if objective > best_score:
-                        best_score = objective
-                        best_payload = {
-                            "strategy_id": strategy_id,
-                            "strategy_name": strategy["name"],
-                            "lookback_days": lookback_days,
-                            "selected_horizon_days": selected_horizon_days,
-                            "status": "completed",
-                            "params": {
-                                "min_score_threshold": min_score_threshold,
-                                "max_ma20_distance_pct": max_ma20_distance_pct,
-                                "volume_spike_multiplier": strategy["params"]["volume_spike_multiplier"],
-                            },
-                            "metrics": {
-                                "sample_count": len(filtered),
-                                "avg_return_pct": round(avg_return, 2),
-                                "win_rate_pct": round(win_rate * 100, 2),
-                                "objective": round(objective, 4),
-                            },
-                        }
+            for horizon in horizons_to_try:
+                horizon_rows = [row for row in candidate_rows if row["horizon_days"] == horizon]
+                if len(horizon_rows) < 6:
+                    continue
+                for preferred_setup_type in ("", "pullback", "breakout"):
+                    for min_score_threshold in (66.0, 70.0, 72.0, 75.0, 78.0):
+                        for max_ma20_distance_pct in (2.5, 3.0, 3.5, 4.0, 4.5):
+                            for max_ma5_distance_pct in (1.5, 2.0, 2.5, 3.0):
+                                for volume_spike_multiplier in (1.4, 1.6, 1.8, 2.0):
+                                    for market_score_floor in (45.0, 50.0, 55.0):
+                                        filtered = []
+                                        for row in horizon_rows:
+                                            if row["score"] < min_score_threshold:
+                                                continue
+                                            if row["distance_to_ma20_pct"] > max_ma20_distance_pct:
+                                                continue
+                                            if row["volume_spike_factor"] < volume_spike_multiplier:
+                                                continue
+                                            if row["market_score"] < market_score_floor:
+                                                continue
+                                            if preferred_setup_type and row["setup_type"] != preferred_setup_type:
+                                                continue
+                                            if row["setup_type"] == "pullback" and row["distance_to_ma5_pct"] > max_ma5_distance_pct:
+                                                continue
+                                            filtered.append(row)
+
+                                        min_samples = 8 if not preferred_setup_type else 6
+                                        if len(filtered) < min_samples:
+                                            continue
+
+                                        avg_return = sum(row["return_pct"] for row in filtered) / len(filtered)
+                                        win_rate = sum(1 for row in filtered if row["return_pct"] > 0) / len(filtered)
+                                        avg_drawdown = sum(row["max_drawdown_pct"] for row in filtered) / len(filtered)
+                                        worst_drawdown = min(row["max_drawdown_pct"] for row in filtered)
+                                        objective = (
+                                            avg_return * 0.9
+                                            + win_rate * 12.0
+                                            - abs(avg_drawdown) * 0.75
+                                            + min(len(filtered), 30) * 0.03
+                                        )
+                                        if objective > best_score:
+                                            best_score = objective
+                                            setup_breakdown = {
+                                                "pullback": sum(1 for row in filtered if row["setup_type"] == "pullback"),
+                                                "breakout": sum(1 for row in filtered if row["setup_type"] == "breakout"),
+                                                "mixed": sum(1 for row in filtered if row["setup_type"] not in {"pullback", "breakout"}),
+                                            }
+                                            best_payload = {
+                                                "strategy_id": strategy_id,
+                                                "strategy_name": strategy["name"],
+                                                "lookback_days": lookback_days,
+                                                "selected_horizon_days": horizon,
+                                                "status": "completed",
+                                                "params": {
+                                                    "min_score_threshold": min_score_threshold,
+                                                    "max_ma20_distance_pct": max_ma20_distance_pct,
+                                                    "max_ma5_distance_pct": max_ma5_distance_pct,
+                                                    "volume_spike_multiplier": volume_spike_multiplier,
+                                                    "market_score_floor": market_score_floor,
+                                                    "preferred_setup_type": preferred_setup_type,
+                                                },
+                                                "metrics": {
+                                                    "sample_count": len(filtered),
+                                                    "avg_return_pct": round(avg_return, 2),
+                                                    "win_rate_pct": round(win_rate * 100, 2),
+                                                    "avg_max_drawdown_pct": round(avg_drawdown, 2),
+                                                    "worst_drawdown_pct": round(worst_drawdown, 2),
+                                                    "objective": round(objective, 4),
+                                                    "setup_type_distribution": setup_breakdown,
+                                                },
+                                            }
 
             if best_payload is None:
                 best_payload = {
                     "strategy_id": strategy_id,
                     "strategy_name": strategy["name"],
                     "lookback_days": lookback_days,
-                    "selected_horizon_days": selected_horizon_days,
+                    "selected_horizon_days": int(selected_horizon_days or 5),
                     "status": "insufficient_data",
                     "params": dict(strategy["params"]),
                     "metrics": {"sample_count": len(candidate_rows)},
@@ -1426,6 +1517,7 @@ class StockPickerService:
         distance_to_ma20_pct = abs(close_price - ma20) / max(ma20, 0.01) * 100
         distance_to_ma5_pct = abs(close_price - ma5) / max(ma5, 0.01) * 100
         volume_spike_factor = float((recent8["volume"] / recent8["vol_ma20"].replace(0, pd.NA)).max(skipna=True) or 0.0)
+        market_score = float(market_snapshot.get("score", 50.0) or 50.0)
         ma5_cross_ma20 = bool(prev["ma5"] <= prev["ma20"] and today["ma5"] > today["ma20"])
         ma5_cross_recent = bool((bars["ma5"].shift(1) <= bars["ma20"].shift(1)).tail(2).any() and (bars["ma5"] > bars["ma20"]).tail(2).any())
         ma20_up = bool(today["ma20_slope"] > 0)
@@ -1449,6 +1541,9 @@ class StockPickerService:
         score = 0.0
         passed = False
         setup_type = "mixed"
+        preferred_setup_type = str(params.get("preferred_setup_type") or "").strip().lower()
+        market_score_floor = float(params.get("market_score_floor", 0.0) or 0.0)
+        max_ma5_distance_pct = float(params.get("max_ma5_distance_pct", 2.0) or 2.0)
 
         if strategy_id in {"mainboard_swing_master", "ma_golden_cross"}:
             breakout_mode = (
@@ -1485,6 +1580,7 @@ class StockPickerService:
                 and touch_ma5
                 and ma60_up
                 and volume_spike_factor >= float(params.get("volume_spike_multiplier", 1.5))
+                and distance_to_ma5_pct <= max_ma5_distance_pct
             )
             if pullback_mode:
                 setup_type = "pullback" if strategy_id != "mainboard_swing_master" or not passed else "mixed"
@@ -1515,11 +1611,16 @@ class StockPickerService:
 
         if ma60_up:
             score += 8
-        if market_snapshot.get("score", 50) >= 55:
+        if market_score >= 55:
             score += 6
 
         min_score_threshold = float(params.get("min_score_threshold", 70.0))
         passed = passed and score >= min_score_threshold
+        if market_score_floor > 0 and market_score < market_score_floor:
+            passed = False
+            reasons.append(f"A股情绪分 {round(market_score, 2)} 低于阈值 {round(market_score_floor, 2)}")
+        if preferred_setup_type in {"pullback", "breakout"} and setup_type != preferred_setup_type:
+            passed = False
 
         if not passed:
             return StrategySignal(
@@ -1535,6 +1636,7 @@ class StockPickerService:
                     "distance_to_ma20_pct": round(distance_to_ma20_pct, 2),
                     "distance_to_ma5_pct": round(distance_to_ma5_pct, 2),
                     "volume_spike_factor": round(volume_spike_factor, 2),
+                    "market_score": round(market_score, 2),
                     "trend_stack_up": trend_stack_up,
                     "ma20_up": ma20_up,
                     "ma60_up": ma60_up,
@@ -1557,6 +1659,7 @@ class StockPickerService:
                 "distance_to_ma20_pct": round(distance_to_ma20_pct, 2),
                 "distance_to_ma5_pct": round(distance_to_ma5_pct, 2),
                 "volume_spike_factor": round(volume_spike_factor, 2),
+                "market_score": round(market_score, 2),
                 "trend_stack_up": trend_stack_up,
                 "ma20_up": ma20_up,
                 "ma60_up": ma60_up,
@@ -2145,11 +2248,30 @@ def _picker_build_action_plan(
         f"{prompt}"
     )
 
-    def generate_once(prompt_text: str, *, max_tokens: int, temperature: float) -> str:
-        primary_model = str(getattr(self.config, "litellm_model", "") or "")
-        if primary_model.startswith("openai/"):
+    def _deepseek_picker_fallback_model() -> Optional[str]:
+        fallback_models = list(getattr(self.config, "litellm_fallback_models", []) or [])
+        for model_name in fallback_models:
+            if str(model_name or "").startswith("deepseek/"):
+                return str(model_name)
+        configured_models = [
+            str((entry.get("model_name") or "")).strip()
+            for entry in (getattr(self.config, "llm_model_list", []) or [])
+        ]
+        for model_name in configured_models:
+            if model_name.startswith("deepseek/"):
+                return model_name
+        return "deepseek/deepseek-chat"
+
+    def generate_with_model(
+        model_name: str,
+        prompt_text: str,
+        *,
+        max_tokens: int,
+        temperature: float,
+    ) -> str:
+        if model_name.startswith("openai/"):
             generated, _usage = self.analyzer._call_openai_responses_stream_fallback(
-                model=primary_model,
+                model=model_name,
                 prompt=prompt_text,
                 system_prompt=self.analyzer.TEXT_SYSTEM_PROMPT,
                 config=self.config,
@@ -2157,7 +2279,14 @@ def _picker_build_action_plan(
                 temperature=temperature,
                 timeout_seconds=75,
             )
-        else:
+            return str(generated or "").strip()
+
+        override = copy(self.config)
+        override.litellm_model = model_name
+        override.litellm_fallback_models = []
+        previous_override = getattr(self.analyzer, "_config_override", None)
+        self.analyzer._config_override = override
+        try:
             result = self.analyzer._call_litellm(
                 prompt_text,
                 {
@@ -2168,7 +2297,12 @@ def _picker_build_action_plan(
                 stream=True,
             )
             generated = result[0] if isinstance(result, tuple) else result
-        return str(generated or "").strip()
+            return str(generated or "").strip()
+        finally:
+            self.analyzer._config_override = previous_override
+
+    primary_model = str(getattr(self.config, "litellm_model", "") or "")
+    fallback_model = _deepseek_picker_fallback_model()
 
     attempts = (
         (prompt, 900, 0.25),
@@ -2177,15 +2311,28 @@ def _picker_build_action_plan(
     last_error: Optional[Exception] = None
     last_output = ""
     for prompt_text, max_tokens, temperature in attempts:
-        try:
-            generated = generate_once(prompt_text, max_tokens=max_tokens, temperature=temperature)
-            last_output = generated
-            if _picker_is_action_plan_usable(generated):
-                return generated, getattr(self.config, "litellm_model", None)
-        except Exception as exc:
-            last_error = exc
-            logger.warning("Stock picker LLM action plan generation failed for %s: %s", candidate.get("code"), exc)
-            continue
+        for model_name in [primary_model, fallback_model]:
+            if not model_name:
+                continue
+            try:
+                generated = generate_with_model(
+                    model_name,
+                    prompt_text,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+                last_output = generated
+                if _picker_is_action_plan_usable(generated):
+                    return generated, model_name
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "Stock picker LLM action plan generation failed for %s via %s: %s",
+                    candidate.get("code"),
+                    model_name,
+                    exc,
+                )
+                continue
 
     if last_error is not None:
         raise RuntimeError(f"LLM generation failed: {last_error}") from last_error
@@ -2689,6 +2836,318 @@ def _picker_get_market_sentiment(self: StockPickerService) -> Dict[str, Any]:
     }
 
 
+def _picker_query_strategy_backtest_rows(
+    self: StockPickerService,
+    *,
+    strategy_id: Optional[str] = None,
+    horizon_days: Optional[int] = None,
+    scan_date_from: Optional[date] = None,
+    scan_date_to: Optional[date] = None,
+    top_n: int = 5,
+) -> List[tuple[StockSelectionBacktest, StockSelectionCandidate, StockSelectionRun]]:
+    conditions = [
+        StockSelectionCandidate.selected.is_(True),
+        StockSelectionCandidate.rank <= max(int(top_n or 5), 1),
+    ]
+    if strategy_id:
+        conditions.append(StockSelectionCandidate.strategy_id == strategy_id)
+    if horizon_days is not None:
+        conditions.append(StockSelectionBacktest.horizon_days == int(horizon_days))
+    if scan_date_from is not None:
+        conditions.append(StockSelectionRun.scan_date >= scan_date_from)
+    if scan_date_to is not None:
+        conditions.append(StockSelectionRun.scan_date <= scan_date_to)
+
+    with self.db.get_session() as session:
+        rows = session.execute(
+            select(StockSelectionBacktest, StockSelectionCandidate, StockSelectionRun)
+            .join(
+                StockSelectionCandidate,
+                StockSelectionBacktest.candidate_id == StockSelectionCandidate.id,
+            )
+            .join(
+                StockSelectionRun,
+                StockSelectionCandidate.run_id == StockSelectionRun.id,
+            )
+            .where(and_(*conditions))
+            .order_by(
+                desc(StockSelectionRun.scan_date),
+                StockSelectionCandidate.rank.asc(),
+                StockSelectionBacktest.horizon_days.asc(),
+                desc(StockSelectionRun.created_at),
+            )
+        ).all()
+    return list(rows)
+
+
+def _picker_build_backtest_metrics(
+    completed_rows: Sequence[tuple[StockSelectionBacktest, StockSelectionCandidate, StockSelectionRun]],
+) -> Dict[str, Any]:
+    if not completed_rows:
+        return {
+            "completed_count": 0,
+            "win_count": 0,
+            "loss_count": 0,
+            "neutral_count": 0,
+            "win_rate_pct": None,
+            "avg_return_pct": None,
+            "avg_max_drawdown_pct": None,
+            "worst_drawdown_pct": None,
+        }
+
+    returns = [float(row[0].return_pct or 0.0) for row in completed_rows if row[0].return_pct is not None]
+    drawdowns = [float(row[0].max_drawdown_pct or 0.0) for row in completed_rows if row[0].max_drawdown_pct is not None]
+    win_count = sum(1 for row in completed_rows if str(row[0].outcome or "").lower() == "win")
+    loss_count = sum(1 for row in completed_rows if str(row[0].outcome or "").lower() == "loss")
+    neutral_count = sum(1 for row in completed_rows if str(row[0].outcome or "").lower() == "neutral")
+    completed_count = len(completed_rows)
+    return {
+        "completed_count": completed_count,
+        "win_count": win_count,
+        "loss_count": loss_count,
+        "neutral_count": neutral_count,
+        "win_rate_pct": round(win_count / completed_count * 100.0, 2) if completed_count else None,
+        "avg_return_pct": round(sum(returns) / len(returns), 2) if returns else None,
+        "avg_max_drawdown_pct": round(sum(drawdowns) / len(drawdowns), 2) if drawdowns else None,
+        "worst_drawdown_pct": round(min(drawdowns), 2) if drawdowns else None,
+    }
+
+
+def _picker_get_strategy_backtest_summary(
+    self: StockPickerService,
+    *,
+    strategy_id: Optional[str] = None,
+    horizon_days: int = 5,
+    scan_date_from: Optional[date] = None,
+    scan_date_to: Optional[date] = None,
+    top_n: int = 5,
+) -> Dict[str, Any]:
+    rows = self._query_strategy_backtest_rows(
+        strategy_id=strategy_id,
+        horizon_days=horizon_days,
+        scan_date_from=scan_date_from,
+        scan_date_to=scan_date_to,
+        top_n=top_n,
+    )
+    completed_rows = [row for row in rows if str(row[0].status or "").lower() == "completed"]
+    pending_count = sum(1 for row in rows if str(row[0].status or "").lower() != "completed")
+    metrics = self._build_backtest_metrics(completed_rows)
+
+    strategy_distribution: Dict[str, Dict[str, Any]] = {}
+    setup_type_distribution: Dict[str, Dict[str, Any]] = {}
+    scan_dates: set[str] = set()
+    stock_codes: set[str] = set()
+
+    for backtest, candidate, run in rows:
+        strategy_key = str(run.strategy_id or candidate.strategy_id or "unknown")
+        bucket = strategy_distribution.setdefault(
+            strategy_key,
+            {
+                "strategy_id": strategy_key,
+                "strategy_name": str(run.strategy_name or strategy_key),
+                "total_evaluations": 0,
+                "pending_count": 0,
+                "_completed_rows": [],
+            },
+        )
+        bucket["total_evaluations"] += 1
+        if str(backtest.status or "").lower() == "completed":
+            bucket["_completed_rows"].append((backtest, candidate, run))
+        else:
+            bucket["pending_count"] += 1
+        if run.scan_date is not None:
+            scan_dates.add(run.scan_date.isoformat())
+        if candidate.code:
+            stock_codes.add(candidate.code)
+        setup_key = str(candidate.setup_type or "mixed")
+        setup_bucket = setup_type_distribution.setdefault(
+            setup_key,
+            {
+                "setup_type": setup_key,
+                "total_evaluations": 0,
+                "pending_count": 0,
+                "_completed_rows": [],
+            },
+        )
+        setup_bucket["total_evaluations"] += 1
+        if str(backtest.status or "").lower() == "completed":
+            setup_bucket["_completed_rows"].append((backtest, candidate, run))
+        else:
+            setup_bucket["pending_count"] += 1
+
+    distribution_items: List[Dict[str, Any]] = []
+    for item in strategy_distribution.values():
+        item_metrics = self._build_backtest_metrics(item.pop("_completed_rows"))
+        distribution_items.append(
+            {
+                **item,
+                **item_metrics,
+            }
+        )
+    distribution_items.sort(
+        key=lambda item: (
+            -int(item.get("completed_count") or 0),
+            -float(item.get("win_rate_pct") or 0.0),
+            str(item.get("strategy_name") or ""),
+        )
+    )
+    setup_items: List[Dict[str, Any]] = []
+    for item in setup_type_distribution.values():
+        item_metrics = self._build_backtest_metrics(item.pop("_completed_rows"))
+        setup_items.append({**item, **item_metrics})
+    setup_items.sort(
+        key=lambda item: (
+            -int(item.get("completed_count") or 0),
+            -float(item.get("win_rate_pct") or 0.0),
+            str(item.get("setup_type") or ""),
+        )
+    )
+
+    latest_scan_date = None
+    if rows:
+        latest_date = max((row[2].scan_date for row in rows if row[2].scan_date is not None), default=None)
+        latest_scan_date = latest_date.isoformat() if latest_date is not None else None
+
+    strategy_name = None
+    if strategy_id:
+        try:
+            strategy_name = self._resolve_strategy(strategy_id).get("name")
+        except Exception:
+            strategy_name = strategy_id
+
+    return {
+        "strategy_id": strategy_id,
+        "strategy_name": strategy_name,
+        "horizon_days": int(horizon_days),
+        "top_n": int(top_n),
+        "total_evaluations": len(rows),
+        "pending_count": pending_count,
+        "scan_count": len(scan_dates),
+        "stock_count": len(stock_codes),
+        "latest_scan_date": latest_scan_date,
+        "strategy_distribution": distribution_items,
+        "setup_type_distribution": setup_items,
+        **metrics,
+    }
+
+
+def _picker_get_strategy_backtest_results(
+    self: StockPickerService,
+    *,
+    strategy_id: Optional[str] = None,
+    horizon_days: int = 5,
+    scan_date_from: Optional[date] = None,
+    scan_date_to: Optional[date] = None,
+    top_n: int = 5,
+    page: int = 1,
+    limit: int = 30,
+) -> Dict[str, Any]:
+    rows = self._query_strategy_backtest_rows(
+        strategy_id=strategy_id,
+        horizon_days=horizon_days,
+        scan_date_from=scan_date_from,
+        scan_date_to=scan_date_to,
+        top_n=top_n,
+    )
+    total = len(rows)
+    offset = max(page - 1, 0) * limit
+    page_rows = rows[offset: offset + limit]
+    items: List[Dict[str, Any]] = []
+    for backtest, candidate, run in page_rows:
+        items.append(
+            {
+                "id": int(backtest.id),
+                "candidate_id": int(candidate.id),
+                "run_id": int(run.id),
+                "strategy_id": str(run.strategy_id or candidate.strategy_id or ""),
+                "strategy_name": str(run.strategy_name or candidate.strategy_id or ""),
+                "code": candidate.code,
+                "name": candidate.name,
+                "scan_date": run.scan_date.isoformat() if run.scan_date else None,
+                "rank": int(candidate.rank or 0),
+                "score": round(float(candidate.score or 0.0), 2),
+                "setup_type": candidate.setup_type,
+                "horizon_days": int(backtest.horizon_days or 0),
+                "status": backtest.status,
+                "entry_date": backtest.entry_date.isoformat() if backtest.entry_date else None,
+                "exit_date": backtest.exit_date.isoformat() if backtest.exit_date else None,
+                "entry_price": backtest.entry_price,
+                "exit_price": backtest.exit_price,
+                "return_pct": backtest.return_pct,
+                "max_drawdown_pct": backtest.max_drawdown_pct,
+                "outcome": backtest.outcome,
+            }
+        )
+    return {
+        "total": total,
+        "page": int(page),
+        "limit": int(limit),
+        "items": items,
+    }
+
+
+def _picker_run_strategy_backtest_refresh(
+    self: StockPickerService,
+    *,
+    strategy_id: Optional[str] = None,
+    horizon_days: int = 5,
+    top_n: int = 5,
+    max_candidates: int = 2000,
+) -> Dict[str, Any]:
+    stats = self.backfill_backtests(
+        strategy_id=strategy_id,
+        max_candidates=max(max_candidates, 200),
+    )
+    summary = self.get_strategy_backtest_summary(
+        strategy_id=strategy_id,
+        horizon_days=horizon_days,
+        top_n=top_n,
+    )
+    return {
+        **stats,
+        "summary": summary,
+    }
+
+
+def _picker_run_weekly_optimization(
+    self: StockPickerService,
+    *,
+    lookback_days: int = 90,
+    max_candidates: int = 3000,
+) -> Dict[str, Any]:
+    backtest_stats = self.backfill_backtests(max_candidates=max_candidates)
+    strategy_payloads: List[Dict[str, Any]] = []
+    for strategy in self.list_strategies():
+        try:
+            payload = self.optimize_strategy(
+                strategy_id=strategy["strategy_id"],
+                lookback_days=lookback_days,
+                selected_horizon_days=None,
+            )
+            strategy_payloads.append(payload)
+        except Exception as exc:
+            logger.warning(
+                "Stock picker weekly optimization failed for %s: %s",
+                strategy.get("strategy_id"),
+                exc,
+            )
+            strategy_payloads.append(
+                {
+                    "strategy_id": strategy.get("strategy_id"),
+                    "strategy_name": strategy.get("name"),
+                    "lookback_days": lookback_days,
+                    "selected_horizon_days": 5,
+                    "status": "error",
+                    "params": {},
+                    "metrics": {"error": str(exc)},
+                }
+            )
+    return {
+        "backtest_stats": backtest_stats,
+        "strategies": strategy_payloads,
+    }
+
+
 def _picker_build_notification_markdown(self: StockPickerService, payload: Dict[str, Any]) -> str:
     scan_date = payload.get("scan_date") or date.today().isoformat()
     strategy_name = payload.get("strategy_name") or payload.get("strategy_id") or "stock picker"
@@ -2763,4 +3222,10 @@ StockPickerService._is_reusable_run_payload = _picker_is_reusable_run_payload
 StockPickerService.run_scheduled_scan = _picker_run_scheduled_scan
 StockPickerService._get_latest_market_snapshot = _picker_get_latest_market_snapshot
 StockPickerService.get_market_sentiment = _picker_get_market_sentiment
+StockPickerService._query_strategy_backtest_rows = _picker_query_strategy_backtest_rows
+StockPickerService._build_backtest_metrics = staticmethod(_picker_build_backtest_metrics)
+StockPickerService.get_strategy_backtest_summary = _picker_get_strategy_backtest_summary
+StockPickerService.get_strategy_backtest_results = _picker_get_strategy_backtest_results
+StockPickerService.run_strategy_backtest_refresh = _picker_run_strategy_backtest_refresh
+StockPickerService.run_weekly_optimization = _picker_run_weekly_optimization
 StockPickerService._build_notification_markdown = _picker_build_notification_markdown

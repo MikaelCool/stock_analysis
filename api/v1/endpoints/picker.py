@@ -95,6 +95,101 @@ class MarketSentimentResponse(BaseModel):
     updated_at: Optional[str] = None
 
 
+class PickerStrategyDistributionItem(BaseModel):
+    strategy_id: str
+    strategy_name: str
+    total_evaluations: int
+    pending_count: int
+    completed_count: int
+    win_count: int
+    loss_count: int
+    neutral_count: int
+    win_rate_pct: Optional[float] = None
+    avg_return_pct: Optional[float] = None
+    avg_max_drawdown_pct: Optional[float] = None
+    worst_drawdown_pct: Optional[float] = None
+
+
+class PickerSetupTypeDistributionItem(BaseModel):
+    setup_type: str
+    total_evaluations: int
+    pending_count: int
+    completed_count: int
+    win_count: int
+    loss_count: int
+    neutral_count: int
+    win_rate_pct: Optional[float] = None
+    avg_return_pct: Optional[float] = None
+    avg_max_drawdown_pct: Optional[float] = None
+    worst_drawdown_pct: Optional[float] = None
+
+
+class PickerBacktestSummaryResponse(BaseModel):
+    strategy_id: Optional[str] = None
+    strategy_name: Optional[str] = None
+    horizon_days: int
+    top_n: int
+    total_evaluations: int
+    pending_count: int
+    completed_count: int
+    win_count: int
+    loss_count: int
+    neutral_count: int
+    win_rate_pct: Optional[float] = None
+    avg_return_pct: Optional[float] = None
+    avg_max_drawdown_pct: Optional[float] = None
+    worst_drawdown_pct: Optional[float] = None
+    scan_count: int
+    stock_count: int
+    latest_scan_date: Optional[str] = None
+    strategy_distribution: List[PickerStrategyDistributionItem] = Field(default_factory=list)
+    setup_type_distribution: List[PickerSetupTypeDistributionItem] = Field(default_factory=list)
+
+
+class PickerBacktestResultItem(BaseModel):
+    id: int
+    candidate_id: int
+    run_id: int
+    strategy_id: str
+    strategy_name: str
+    code: str
+    name: Optional[str] = None
+    scan_date: Optional[str] = None
+    rank: int
+    score: float
+    setup_type: str
+    horizon_days: int
+    status: str
+    entry_date: Optional[str] = None
+    exit_date: Optional[str] = None
+    entry_price: Optional[float] = None
+    exit_price: Optional[float] = None
+    return_pct: Optional[float] = None
+    max_drawdown_pct: Optional[float] = None
+    outcome: Optional[str] = None
+
+
+class PickerBacktestResultsResponse(BaseModel):
+    total: int
+    page: int
+    limit: int
+    items: List[PickerBacktestResultItem] = Field(default_factory=list)
+
+
+class PickerBacktestRunRequest(BaseModel):
+    strategy_id: Optional[str] = None
+    horizon_days: int = Field(default=5, ge=1, le=10)
+    top_n: int = Field(default=5, ge=1, le=10)
+    max_candidates: int = Field(default=2000, ge=50, le=10000)
+
+
+class PickerBacktestRunResponse(BaseModel):
+    processed: int
+    completed: int
+    pending: int
+    summary: PickerBacktestSummaryResponse
+
+
 @router.get("/strategies", response_model=StrategyListResponse)
 async def get_picker_strategies():
     return StrategyListResponse(strategies=[StrategyOption(**item) for item in StockPickerService.list_strategies()])
@@ -144,3 +239,59 @@ async def run_picker_scan(request: PickerScanRequest):
 async def backfill_picker_backtests(strategy_id: Optional[str] = None):
     service = StockPickerService()
     return service.backfill_backtests(strategy_id=strategy_id)
+
+
+@router.get("/backtest/summary", response_model=PickerBacktestSummaryResponse)
+async def get_picker_backtest_summary(
+    strategy_id: Optional[str] = None,
+    horizon_days: int = 5,
+    scan_date_from: Optional[date] = None,
+    scan_date_to: Optional[date] = None,
+    top_n: int = 5,
+):
+    service = StockPickerService()
+    return PickerBacktestSummaryResponse(
+        **service.get_strategy_backtest_summary(
+            strategy_id=strategy_id,
+            horizon_days=horizon_days,
+            scan_date_from=scan_date_from,
+            scan_date_to=scan_date_to,
+            top_n=top_n,
+        )
+    )
+
+
+@router.get("/backtest/results", response_model=PickerBacktestResultsResponse)
+async def get_picker_backtest_results(
+    strategy_id: Optional[str] = None,
+    horizon_days: int = 5,
+    scan_date_from: Optional[date] = None,
+    scan_date_to: Optional[date] = None,
+    top_n: int = 5,
+    page: int = 1,
+    limit: int = 30,
+):
+    service = StockPickerService()
+    return PickerBacktestResultsResponse(
+        **service.get_strategy_backtest_results(
+            strategy_id=strategy_id,
+            horizon_days=horizon_days,
+            scan_date_from=scan_date_from,
+            scan_date_to=scan_date_to,
+            top_n=top_n,
+            page=page,
+            limit=limit,
+        )
+    )
+
+
+@router.post("/backtest/run", response_model=PickerBacktestRunResponse)
+async def run_picker_backtest_refresh(request: PickerBacktestRunRequest):
+    service = StockPickerService()
+    payload = service.run_strategy_backtest_refresh(
+        strategy_id=request.strategy_id,
+        horizon_days=request.horizon_days,
+        top_n=request.top_n,
+        max_candidates=request.max_candidates,
+    )
+    return PickerBacktestRunResponse(**payload)
