@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -230,6 +231,8 @@ class StockPickerService:
         except Exception as exc:
             logger.warning("Stock picker search service unavailable: %s", exc)
         self.analyzer = GeminiAnalyzer(config=self.config)
+        self._board_cache: Dict[str, List[Dict[str, Any]]] = {}
+        self._sector_snapshot_cache: Dict[str, Dict[str, Any]] = {}
 
     @staticmethod
     def list_strategies() -> List[Dict[str, Any]]:
@@ -316,6 +319,7 @@ class StockPickerService:
         strategy_params: Optional[Dict[str, Any]] = None,
         send_notification: bool = True,
         force_refresh: bool = False,
+        recompute_market_snapshot: bool = False,
     ) -> Dict[str, Any]:
         if not getattr(self.config, "stock_picker_enabled", True):
             raise ValueError("stock picker is disabled")
@@ -342,8 +346,11 @@ class StockPickerService:
 
         self._ensure_recent_market_data(effective_scan_date, lookback_trading_days=90, force_refresh=force_refresh)
         universe = self._load_mainboard_universe()
-        market_snapshot = self._build_market_snapshot()
+        after_close = effective_scan_date == date.today() and datetime.now().time() >= dt_time(15, 0)
+        snapshot_use_cache = not (recompute_market_snapshot or after_close)
+        market_snapshot = self._build_market_snapshot(use_cache=snapshot_use_cache)
         us_snapshot = self._build_us_market_snapshot()
+        sector_snapshot = self._build_sector_snapshot(use_cache=snapshot_use_cache)
         history_frames = self._load_history_frames([item["code"] for item in universe], effective_scan_date)
 
         candidates: List[Dict[str, Any]] = []
@@ -388,6 +395,11 @@ class StockPickerService:
                 }
             )
 
+        self._apply_theme_strength(
+            strategy_id=strategy["strategy_id"],
+            candidates=candidates,
+            sector_snapshot=sector_snapshot,
+        )
         candidates.sort(key=lambda item: item["score"], reverse=True)
         matched_count = len(candidates)
         selected = candidates[:max_selected]
@@ -587,7 +599,24 @@ class StockPickerService:
                     }
                 )
 
+            openai_circuit_open = False
+            failed_codes: List[str] = []
+
+            def should_trip_openai_circuit(exc: Exception) -> bool:
+                text = str(exc).lower()
+                markers = (
+                    "service temporarily unavailable",
+                    "upstream authentication failed",
+                    "key expired",
+                    "upstream error",
+                    "error code: 502",
+                    "error code: 503",
+                    "timed out",
+                )
+                return any(marker in text for marker in markers)
+
             def enrich_candidate(candidate_payload: Dict[str, Any]) -> Dict[str, Any]:
+                nonlocal openai_circuit_open
                 review_payload: Dict[str, Any] = {"news_context": None, "news_score": 50.0, "from_cache": False}
                 try:
                     review_payload = service._collect_candidate_intel(
@@ -611,8 +640,11 @@ class StockPickerService:
                         market_snapshot=market_snapshot,
                         us_snapshot=us_snapshot,
                         review_payload=review_payload,
+                        prefer_fallback_only=openai_circuit_open,
                     )
                 except Exception as exc:
+                    if should_trip_openai_circuit(exc):
+                        openai_circuit_open = True
                     logger.warning(
                         "Stock picker action plan retrying without news for run %s %s: %s",
                         run_id,
@@ -625,6 +657,7 @@ class StockPickerService:
                         market_snapshot=market_snapshot,
                         us_snapshot=us_snapshot,
                         review_payload={"news_context": None, "news_score": 50.0, "from_cache": False},
+                        prefer_fallback_only=openai_circuit_open,
                     )
 
                 return {
@@ -634,6 +667,7 @@ class StockPickerService:
                     else None,
                     "action_plan_markdown": action_plan,
                     "llm_model": llm_model,
+                    "enrichment_error": None,
                 }
 
             enriched_updates: Dict[int, Dict[str, Any]] = {}
@@ -664,7 +698,15 @@ class StockPickerService:
                                 code,
                                 exc,
                             )
-                            raise RuntimeError(f"{code} 操作手册生成失败: {exc}") from exc
+                            failed_codes.append(code)
+                            enriched_updates[int(candidate_payload["id"])] = {
+                                "id": int(candidate_payload["id"]),
+                                "news_context_json": None,
+                                "action_plan_markdown": f"增强版操作手册暂未生成成功，原因：{exc}",
+                                "llm_model": None,
+                                "enrichment_error": str(exc),
+                            }
+                            continue
                         enriched_updates[int(update["id"])] = update
 
             with service.db.session_scope() as session:
@@ -679,7 +721,10 @@ class StockPickerService:
                         continue
                     update = enriched_updates.get(int(row.id))
                     if update is None:
-                        raise RuntimeError(f"{row.code} 操作手册生成失败: 未生成有效结果")
+                        failed_codes.append(str(row.code))
+                        row.action_plan_markdown = row.action_plan_markdown or "增强版操作手册暂未生成成功，请稍后重试。"
+                        row.llm_model = row.llm_model or None
+                        continue
                     row.news_context_json = update.get("news_context_json")
                     row.action_plan_markdown = str(update.get("action_plan_markdown") or "").strip()
                     row.llm_model = update.get("llm_model")
@@ -687,6 +732,7 @@ class StockPickerService:
             service._update_run_status(run_id=run_id, status="completed", completed=True)
             payload = service.get_run_detail(run_id)
             if payload is not None:
+                payload["enrichment_errors"] = failed_codes
                 if send_notification:
                     payload["notification_stage"] = "enhanced"
                     service._send_scan_notification(payload)
@@ -702,9 +748,10 @@ class StockPickerService:
             if payload is not None:
                 payload["backtest_stats"] = backtest_stats
                 payload["optimization"] = optimization
+                payload["enrichment_errors"] = failed_codes
         except Exception as exc:
             logger.exception("Stock picker background enrichment failed for run %s: %s", run_id, exc)
-            service._update_run_status(run_id=run_id, status="failed", completed=False)
+            service._update_run_status(run_id=run_id, status="completed", completed=True)
         finally:
             service._release_enrichment_lock(run_id)
 
@@ -1505,6 +1552,8 @@ class StockPickerService:
             return StrategySignal(False, 0.0, "insufficient", "观望", "均线样本不足", [], None, None, {})
 
         close_price = self._to_float(today["close"])
+        open_price = self._to_float(today["open"])
+        high_price = self._to_float(today["high"])
         ma5 = self._to_float(today["ma5"])
         ma10 = self._to_float(today["ma10"])
         ma20 = self._to_float(today["ma20"])
@@ -1512,8 +1561,12 @@ class StockPickerService:
         ma60 = self._to_float(today["ma60"])
         low_price = self._to_float(today["low"])
         volume = self._to_float(today["volume"])
+        pct_chg = self._to_float(today["pct_chg"])
         vol_ma20 = max(self._to_float(today["vol_ma20"]), 1.0)
         vol_ma5 = max(self._to_float(today["vol_ma5"]), 1.0)
+        recent20 = bars.tail(20)
+        recent40 = bars.tail(40)
+        recent60 = bars.tail(60)
         distance_to_ma20_pct = abs(close_price - ma20) / max(ma20, 0.01) * 100
         distance_to_ma5_pct = abs(close_price - ma5) / max(ma5, 0.01) * 100
         volume_spike_factor = float((recent8["volume"] / recent8["vol_ma20"].replace(0, pd.NA)).max(skipna=True) or 0.0)
@@ -1535,7 +1588,38 @@ class StockPickerService:
         breakout_near_high = bool(close_price >= self._to_float(today["max_high_20_prev"]) * 0.985 if not pd.isna(today["max_high_20_prev"]) else False)
         macd_bull = bool(today["macd_dif"] > today["macd_dea"] and today["macd_hist"] > -0.02)
         kdj_bull = bool(today["kdj_j"] >= today["kdj_k"])
-        strong_body = bool(self._to_float(today["pct_chg"]) >= 2.0)
+        strong_body = bool(pct_chg >= 2.0)
+        body_pct = abs(close_price - open_price) / max(close_price, 0.01) * 100
+        upper_shadow_pct = max(high_price - max(close_price, open_price), 0.0) / max(close_price, 0.01) * 100
+        lower_shadow_pct = max(min(close_price, open_price) - low_price, 0.0) / max(close_price, 0.01) * 100
+        range_20_pct = (self._to_float(recent20["high"].max()) - self._to_float(recent20["low"].min())) / max(close_price, 0.01) * 100
+        range_40_pct = (self._to_float(recent40["high"].max()) - self._to_float(recent40["low"].min())) / max(close_price, 0.01) * 100
+        high_20_prev = self._to_float(recent20["high"].shift(1).max())
+        low_20_prev = self._to_float(recent20["low"].shift(1).min())
+        high_60 = self._to_float(recent60["high"].max())
+        low_60 = self._to_float(recent60["low"].min())
+        recent_decline_pct = (high_60 - close_price) / max(high_60, 0.01) * 100 if high_60 > 0 else 0.0
+        breakout_above_20 = bool(close_price >= max(high_20_prev * 1.002, ma20))
+        support_hold = bool(low_price >= low_20_prev * 0.985 if low_20_prev > 0 else True)
+        tr = pd.concat(
+            [
+                bars["high"] - bars["low"],
+                (bars["high"] - bars["close"].shift(1)).abs(),
+                (bars["low"] - bars["close"].shift(1)).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        atr14 = float(tr.tail(14).mean() or 0.0)
+        atr_pct = atr14 / max(close_price, 0.01) * 100
+        volatility_contract = bool(atr_pct <= max(2.8, float(tr.tail(30).mean() or atr14) / max(close_price, 0.01) * 100 * 0.85))
+        recent_low_idx = recent20["low"].astype(float).idxmin()
+        prior_low_hist = self._to_float(bars.loc[recent_low_idx, "macd_hist"]) if recent_low_idx in bars.index else 0.0
+        bottom_divergence = bool(low_price <= low_20_prev * 1.02 and today["macd_hist"] > prior_low_hist and support_hold)
+        top_divergence = bool(close_price >= high_20_prev * 0.995 and today["macd_hist"] < prev["macd_hist"] and upper_shadow_pct >= 1.0)
+        box_support = bool(close_price <= recent40["low"].min() * 1.04 if len(recent40) >= 20 else False)
+        box_resistance = bool(close_price >= recent40["high"].max() * 0.98 if len(recent40) >= 20 else False)
+        bearish_trend = bool(close_price < ma20 < ma60 and recent_decline_pct >= 15)
+        open_above_prev_close = bool(open_price >= self._to_float(prev["close"]))
 
         reasons: List[str] = []
         score = 0.0
@@ -1609,6 +1693,164 @@ class StockPickerService:
             if macd_bull:
                 score += 10
 
+        if strategy_id == "dragon_head":
+            breakout_mode = (
+                breakout_above_20
+                and ma20_up
+                and ma60_up
+                and volume_spike_factor >= float(params.get("volume_spike_multiplier", 2.0))
+                and pct_chg >= 2.5
+                and close_price >= ma5
+            )
+            if breakout_mode:
+                setup_type = "breakout"
+                score += 44
+                reasons.append("强势突破近端平台，具备龙头候选的动量基础")
+                passed = True
+            if open_above_prev_close:
+                score += 6
+            if strong_body:
+                score += 8
+            if breakout_near_high:
+                score += 8
+            if macd_bull:
+                score += 8
+
+        if strategy_id == "chan_theory":
+            chan_second_buy = bool(
+                trend_stack_up
+                and touch_ma5
+                and close_price > ma20
+                and support_hold
+                and macd_bull
+                and not top_divergence
+            )
+            chan_third_buy = bool(
+                ma20_up
+                and ma60_up
+                and breakout_above_20
+                and close_price > ma10
+                and volume_spike_factor >= max(1.2, float(params.get("volume_spike_multiplier", 1.4)) * 0.8)
+            )
+            if bottom_divergence:
+                setup_type = "pullback"
+                score += 28
+                reasons.append("低位 MACD 背驰改善，接近缠论二买区域")
+            if chan_second_buy:
+                setup_type = "pullback"
+                score += 34
+                reasons.append("均线多头中回踩不破，符合缠论二买结构")
+            if chan_third_buy:
+                setup_type = "breakout"
+                score += 38
+                reasons.append("离开中枢上沿并放量确认，接近缠论三买")
+            passed = bottom_divergence or chan_second_buy or chan_third_buy
+            if top_divergence:
+                passed = False
+                reasons.append("高位背驰迹象明显，暂不作为缠论买点")
+
+        if strategy_id == "wave_theory":
+            impulse_extension = bool(
+                ma20_up
+                and ma60_up
+                and breakout_above_20
+                and volume_spike_factor >= 1.3
+                and pct_chg >= 1.5
+            )
+            retrace_ratio = (high_60 - close_price) / max(high_60 - low_60, 0.01)
+            wave_two_pullback = bool(
+                trend_stack_up
+                and 0.25 <= retrace_ratio <= 0.65
+                and touch_ma5
+                and macd_bull
+            )
+            if wave_two_pullback:
+                setup_type = "pullback"
+                score += 36
+                reasons.append("回撤位置接近波浪理论二浪/四浪区间")
+            if impulse_extension:
+                setup_type = "breakout"
+                score += 40
+                reasons.append("放量推升，具备三浪延伸结构特征")
+            passed = wave_two_pullback or impulse_extension
+
+        if strategy_id == "emotion_cycle":
+            sentiment_bottom = bool(
+                market_score <= 52
+                and volatility_contract
+                and shrink_volume
+                and close_price >= ma20 * 0.97
+                and macd_bull
+            )
+            warm_start = bool(
+                45 <= market_score <= 68
+                and volatility_contract
+                and strong_body
+                and close_price >= ma5
+            )
+            if sentiment_bottom:
+                setup_type = "pullback"
+                score += 34
+                reasons.append("情绪低位叠加波动收敛，具备逆情绪启动条件")
+            if warm_start:
+                setup_type = "breakout"
+                score += 28
+                reasons.append("情绪回暖初期放量转强")
+            passed = sentiment_bottom or warm_start
+
+        if strategy_id == "box_oscillation":
+            box_width_ok = 5.0 <= range_40_pct <= 18.0
+            box_buy = bool(box_width_ok and box_support and support_hold and macd_bull)
+            box_break = bool(box_width_ok and box_resistance and volume_spike_factor >= 1.4 and ma20_up)
+            if box_buy:
+                setup_type = "pullback"
+                score += 34
+                reasons.append("处于箱体底部附近，支撑位有效")
+            if box_break:
+                setup_type = "breakout"
+                score += 30
+                reasons.append("箱体上沿放量突破")
+            passed = box_buy or box_break
+
+        if strategy_id == "bottom_volume":
+            bottom_reversal = bool(
+                bearish_trend
+                and volume_spike_factor >= max(2.4, float(params.get("volume_spike_multiplier", 1.4)) * 1.6)
+                and close_price > open_price
+                and lower_shadow_pct >= 0.8
+                and support_hold
+            )
+            if bottom_reversal:
+                setup_type = "pullback"
+                score += 40
+                reasons.append("下跌后底部放量并收阳，具备反转信号")
+                passed = True
+
+        if strategy_id == "one_yang_three_yin":
+            last5 = bars.tail(5).reset_index(drop=True)
+            if len(last5) == 5:
+                day1 = last5.iloc[0]
+                day5 = last5.iloc[4]
+                middle = last5.iloc[1:4]
+                day1_bull = self._to_float(day1["close"]) > self._to_float(day1["open"]) and (
+                    (self._to_float(day1["close"]) - self._to_float(day1["open"])) / max(self._to_float(day1["close"]), 0.01) * 100 >= 2.0
+                )
+                middle_inside = bool(
+                    (middle["low"] >= min(self._to_float(day1["open"]), self._to_float(day1["close"])) * 0.99).all()
+                    and (middle["high"] <= max(self._to_float(day1["open"]), self._to_float(day1["close"])) * 1.01).all()
+                )
+                middle_shrink = bool((middle["volume"] <= middle["volume"].shift(1).fillna(middle["volume"].iloc[0]) * 1.05).all())
+                day5_break = bool(
+                    self._to_float(day5["close"]) > self._to_float(day5["open"])
+                    and self._to_float(day5["close"]) >= self._to_float(day1["close"])
+                )
+                pattern_ok = day1_bull and middle_inside and middle_shrink and day5_break and trend_stack
+                if pattern_ok:
+                    setup_type = "pullback"
+                    score += 42
+                    reasons.append("一阳夹三阴形态完成，趋势整理后再启动")
+                    passed = True
+
         if ma60_up:
             score += 8
         if market_score >= 55:
@@ -1637,9 +1879,15 @@ class StockPickerService:
                     "distance_to_ma5_pct": round(distance_to_ma5_pct, 2),
                     "volume_spike_factor": round(volume_spike_factor, 2),
                     "market_score": round(market_score, 2),
+                    "pct_chg": round(pct_chg, 2),
+                    "atr14": round(atr14, 2),
+                    "atr_pct": round(atr_pct, 2),
+                    "range_40_pct": round(range_40_pct, 2),
                     "trend_stack_up": trend_stack_up,
                     "ma20_up": ma20_up,
                     "ma60_up": ma60_up,
+                    "top_divergence": top_divergence,
+                    "bottom_divergence": bottom_divergence,
                 },
             )
 
@@ -1660,11 +1908,17 @@ class StockPickerService:
                 "distance_to_ma5_pct": round(distance_to_ma5_pct, 2),
                 "volume_spike_factor": round(volume_spike_factor, 2),
                 "market_score": round(market_score, 2),
+                "pct_chg": round(pct_chg, 2),
+                "atr14": round(atr14, 2),
+                "atr_pct": round(atr_pct, 2),
+                "range_40_pct": round(range_40_pct, 2),
                 "trend_stack_up": trend_stack_up,
                 "ma20_up": ma20_up,
                 "ma60_up": ma60_up,
                 "macd_bull": macd_bull,
                 "kdj_bull": kdj_bull,
+                "top_divergence": top_divergence,
+                "bottom_divergence": bottom_divergence,
             },
         )
 
@@ -1724,6 +1978,180 @@ class StockPickerService:
             "indices": indices,
             "summary": f"隔夜美股情绪 {mood}，弱势指数数 {falling}/{len(indices) or 1}。",
         }
+
+    @staticmethod
+    def _normalize_board_name(name: Any) -> str:
+        text = str(name or "").strip()
+        if not text:
+            return ""
+        text = re.sub(r"\s+", "", text)
+        for suffix in ("概念", "板块", "行业"):
+            if text.endswith(suffix) and len(text) > len(suffix) + 1:
+                text = text[: -len(suffix)]
+        return text.lower()
+
+    def _build_sector_snapshot(self, *, use_cache: bool = True, top_n: int = 12) -> Dict[str, Any]:
+        cache_key = f"{date.today().isoformat()}:{int(use_cache)}:{int(top_n)}"
+        cached = self._sector_snapshot_cache.get(cache_key)
+        if cached:
+            return cached
+
+        top: List[Dict[str, Any]] = []
+        bottom: List[Dict[str, Any]] = []
+        try:
+            top, bottom = self.fetcher_manager.get_sector_rankings(n=top_n) or ([], [])
+        except Exception as exc:
+            logger.warning("Stock picker sector rankings unavailable: %s", exc)
+
+        top_items: List[Dict[str, Any]] = []
+        bottom_items: List[Dict[str, Any]] = []
+        top_map: Dict[str, Dict[str, Any]] = {}
+        bottom_map: Dict[str, Dict[str, Any]] = {}
+
+        for idx, item in enumerate(top or [], start=1):
+            name = str(item.get("name") or "").strip()
+            record = {
+                "name": name,
+                "change_pct": round(self._to_float(item.get("change_pct")), 2),
+                "rank": idx,
+            }
+            top_items.append(record)
+            norm = self._normalize_board_name(name)
+            if norm:
+                top_map[norm] = record
+
+        for idx, item in enumerate(bottom or [], start=1):
+            name = str(item.get("name") or "").strip()
+            record = {
+                "name": name,
+                "change_pct": round(self._to_float(item.get("change_pct")), 2),
+                "rank": idx,
+            }
+            bottom_items.append(record)
+            norm = self._normalize_board_name(name)
+            if norm:
+                bottom_map[norm] = record
+
+        snapshot = {
+            "top": top_items,
+            "bottom": bottom_items,
+            "top_map": top_map,
+            "bottom_map": bottom_map,
+            "updated_at": datetime.now().isoformat(),
+        }
+        self._sector_snapshot_cache[cache_key] = snapshot
+        return snapshot
+
+    def _get_candidate_board_context(self, code: str) -> List[Dict[str, Any]]:
+        normalized_code = str(code or "").strip()
+        if not normalized_code:
+            return []
+        cached = self._board_cache.get(normalized_code)
+        if cached is not None:
+            return cached
+        try:
+            boards = self.fetcher_manager.get_belong_boards(normalized_code) or []
+        except Exception as exc:
+            logger.debug("Stock picker belong boards unavailable for %s: %s", normalized_code, exc)
+            boards = []
+        self._board_cache[normalized_code] = boards
+        return boards
+
+    def _apply_theme_strength(
+        self,
+        *,
+        strategy_id: str,
+        candidates: List[Dict[str, Any]],
+        sector_snapshot: Optional[Dict[str, Any]],
+    ) -> None:
+        if not candidates or not sector_snapshot:
+            return
+
+        top_map = sector_snapshot.get("top_map") or {}
+        bottom_map = sector_snapshot.get("bottom_map") or {}
+        require_hot_theme = strategy_id == "dragon_head"
+
+        filtered: List[Dict[str, Any]] = []
+        for candidate in candidates:
+            boards = self._get_candidate_board_context(str(candidate.get("code") or ""))
+            board_names = [
+                str(item.get("name") or item.get("板块名称") or item.get("industry") or "").strip()
+                for item in boards
+                if str(item.get("name") or item.get("板块名称") or item.get("industry") or "").strip()
+            ]
+            top_hits: List[Dict[str, Any]] = []
+            bottom_hits: List[Dict[str, Any]] = []
+            for board_name in board_names:
+                norm = self._normalize_board_name(board_name)
+                if not norm:
+                    continue
+                if norm in top_map:
+                    top_hits.append(top_map[norm])
+                if norm in bottom_map:
+                    bottom_hits.append(bottom_map[norm])
+
+            top_hits.sort(key=lambda item: item.get("rank", 999))
+            bottom_hits.sort(key=lambda item: item.get("rank", 999))
+            top_hit = top_hits[0] if top_hits else None
+            bottom_hit = bottom_hits[0] if bottom_hits else None
+            pct_chg = self._to_float((candidate.get("metrics") or {}).get("pct_chg"))
+            theme_delta = 0.0
+            theme_reasons: List[str] = []
+
+            if top_hit is not None:
+                top_rank = int(top_hit.get("rank") or 99)
+                if top_rank <= 3:
+                    theme_delta += 12
+                elif top_rank <= 5:
+                    theme_delta += 8
+                else:
+                    theme_delta += 4
+                rel_strength = pct_chg - self._to_float(top_hit.get("change_pct"))
+                if rel_strength >= 2.0:
+                    theme_delta += 6
+                    theme_reasons.append(f"题材 {top_hit['name']} 处于领涨前列，个股强于板块 {rel_strength:.2f}%")
+                elif rel_strength >= 0.5:
+                    theme_delta += 3
+                    theme_reasons.append(f"题材 {top_hit['name']} 处于领涨前列，个股强于板块 {rel_strength:.2f}%")
+                else:
+                    theme_reasons.append(f"所属题材 {top_hit['name']} 位于强势区")
+
+            if bottom_hit is not None:
+                bottom_rank = int(bottom_hit.get("rank") or 99)
+                if bottom_rank <= 3:
+                    theme_delta -= 10
+                elif bottom_rank <= 5:
+                    theme_delta -= 6
+                else:
+                    theme_delta -= 3
+                theme_reasons.append(f"所属题材 {bottom_hit['name']} 处于弱势区")
+
+            if strategy_id == "mainboard_swing_master" and top_hit is None and not board_names:
+                theme_reasons.append("未拿到明确板块归属，题材强度按中性处理")
+
+            if strategy_id == "dragon_head":
+                hot_theme_pass = top_hit is not None and int(top_hit.get("rank") or 99) <= 5 and pct_chg >= 2.5
+                if hot_theme_pass:
+                    theme_delta += 8
+                    theme_reasons.append("符合龙头策略的题材强度要求")
+                elif require_hot_theme:
+                    continue
+
+            candidate["score"] = round(float(candidate.get("score") or 0.0) + theme_delta, 2)
+            metrics = candidate.setdefault("metrics", {})
+            metrics["theme_boards"] = board_names[:6]
+            metrics["theme_score_delta"] = round(theme_delta, 2)
+            metrics["theme_hot_sector"] = top_hit
+            metrics["theme_cold_sector"] = bottom_hit
+            metrics["theme_strength_label"] = "hot" if theme_delta > 0 else ("cold" if theme_delta < 0 else "neutral")
+            reasons = candidate.setdefault("reasons", [])
+            for reason in theme_reasons[:2]:
+                if reason not in reasons:
+                    reasons.append(reason)
+            filtered.append(candidate)
+
+        if require_hot_theme:
+            candidates[:] = filtered
 
     def _collect_candidate_intel(
         self,
@@ -2139,6 +2567,85 @@ def _picker_is_action_plan_usable(text: Optional[str]) -> bool:
     return all(label in content for label in required_prices)
 
 
+def _picker_repair_action_plan(
+    self: StockPickerService,
+    *,
+    candidate: Dict[str, Any],
+    strategy: Dict[str, Any],
+    market_snapshot: Dict[str, Any],
+    us_snapshot: Dict[str, Any],
+    text: Optional[str],
+) -> str:
+    content = (text or "").strip()
+    if not content:
+        return ""
+
+    trade_levels = self._derive_trade_levels(candidate)
+    stock_profile = self._build_stock_profile(candidate)
+    reasons = "；".join(str(item) for item in (candidate.get("reasons") or [])[:4]) or "量价结构满足策略条件"
+
+    trade_block = (
+        "四、挂单计划\n"
+        f"- 低吸挂单价：{self._format_price(trade_levels['buy_low'])}\n"
+        f"- 接力挂单价：{self._format_price(trade_levels['buy_high'])}\n"
+        f"- 突破追价：{self._format_price(trade_levels['breakout_buy'])}\n"
+        f"- 首次减仓价：{self._format_price(trade_levels['reduce_price'])}\n"
+        f"- 止盈价：{self._format_price(trade_levels['take_profit'])}\n"
+        f"- 止损价：{self._format_price(trade_levels['stop_loss'])}\n"
+        f"- 放弃价：{self._format_price(trade_levels['abandon_price'])}\n"
+    )
+
+    fallback_sections = {
+        "一、个股画像": (
+            "一、个股画像\n"
+            f"- {stock_profile}\n"
+            f"- 量化结论：{candidate.get('analysis_summary')}\n"
+            f"- 触发原因：{reasons}\n"
+        ),
+        "二、入场前提": (
+            "二、入场前提\n"
+            f"- 先确认股价稳住 {self._format_price(trade_levels['buy_low'])} 上方，跌破 {self._format_price(trade_levels['abandon_price'])} 当天放弃。\n"
+            f"- 板块和指数若同步转弱，只保留轻仓试错。\n"
+        ),
+        "三、三种开盘预案": (
+            "三、三种开盘预案\n"
+            f"- 平开或小低开：观察 {self._format_price(trade_levels['buy_low'])}-{self._format_price(trade_levels['buy_high'])} 承接，缩量回踩可低吸。\n"
+            f"- 小幅高开：不追高，等回踩不破 {self._format_price(trade_levels['buy_high'])} 再考虑接力。\n"
+            f"- 强势突破：只有放量站上 {self._format_price(trade_levels['breakout_buy'])} 才允许追价。\n"
+        ),
+        "五、持仓与卖出": (
+            "五、持仓与卖出\n"
+            f"- 先看 {self._format_price(trade_levels['reduce_price'])} 一带是否能实现首次减仓，接近 {self._format_price(trade_levels['take_profit'])} 再分批兑现。\n"
+            f"- 跌破 {self._format_price(trade_levels['stop_loss'])} 直接止损，不拖延。\n"
+        ),
+        "六、风险点": (
+            "六、风险点\n"
+            f"- A股情绪：{market_snapshot.get('summary') or market_snapshot.get('regime') or '中性'}。\n"
+            f"- 美股情绪：{us_snapshot.get('summary') or us_snapshot.get('mood') or '中性'}。\n"
+            "- 若新闻突发利空或板块龙头转弱，优先降仓位。\n"
+        ),
+    }
+
+    if "四、挂单计划" in content:
+        content = re.sub(
+            r"四、挂单计划[\s\S]*?(?=\n五、持仓与卖出|\Z)",
+            trade_block.strip(),
+            content,
+            flags=re.MULTILINE,
+        )
+    else:
+        if "五、持仓与卖出" in content:
+            content = content.replace("五、持仓与卖出", f"{trade_block}\n五、持仓与卖出", 1)
+        else:
+            content = f"{content}\n\n{trade_block}"
+
+    for section_name, section_text in fallback_sections.items():
+        if section_name not in content:
+            content = f"{content}\n\n{section_text.strip()}"
+
+    return content.strip()
+
+
 def _picker_build_template_action_plan(
     self: StockPickerService,
     *,
@@ -2192,8 +2699,14 @@ def _picker_build_action_plan(
     market_snapshot: Dict[str, Any],
     us_snapshot: Dict[str, Any],
     review_payload: Optional[Dict[str, Any]],
+    prefer_fallback_only: bool = False,
 ) -> tuple[str, Optional[str]]:
     review_text = review_payload.get("news_context") if isinstance(review_payload, dict) else None
+    picker_system_prompt = (
+        "你是A股收盘后交易执行助手。"
+        "必须直接输出完整中文操作手册，不要写“好的”“下面开始分析”“作为AI”等前置废话。"
+        "必须给出具体挂单价格，并严格使用指定标题。"
+    )
     compact_review_text = self._picker_compact_review_text(
         code=str(candidate.get("code") or ""),
         name=str(candidate.get("name") or ""),
@@ -2273,7 +2786,7 @@ def _picker_build_action_plan(
             generated, _usage = self.analyzer._call_openai_responses_stream_fallback(
                 model=model_name,
                 prompt=prompt_text,
-                system_prompt=self.analyzer.TEXT_SYSTEM_PROMPT,
+                system_prompt=picker_system_prompt,
                 config=self.config,
                 max_tokens=max_tokens,
                 temperature=temperature,
@@ -2294,7 +2807,8 @@ def _picker_build_action_plan(
                     "temperature": temperature,
                     "timeout_seconds": 75,
                 },
-                stream=True,
+                system_prompt=picker_system_prompt,
+                stream=False,
             )
             generated = result[0] if isinstance(result, tuple) else result
             return str(generated or "").strip()
@@ -2303,6 +2817,11 @@ def _picker_build_action_plan(
 
     primary_model = str(getattr(self.config, "litellm_model", "") or "")
     fallback_model = _deepseek_picker_fallback_model()
+    model_order: List[str] = []
+    if not prefer_fallback_only and primary_model:
+        model_order.append(primary_model)
+    if fallback_model and fallback_model not in model_order:
+        model_order.append(fallback_model)
 
     attempts = (
         (prompt, 900, 0.25),
@@ -2311,7 +2830,7 @@ def _picker_build_action_plan(
     last_error: Optional[Exception] = None
     last_output = ""
     for prompt_text, max_tokens, temperature in attempts:
-        for model_name in [primary_model, fallback_model]:
+        for model_name in model_order:
             if not model_name:
                 continue
             try:
@@ -2320,6 +2839,18 @@ def _picker_build_action_plan(
                     prompt_text,
                     max_tokens=max_tokens,
                     temperature=temperature,
+                )
+                generated = str(generated or "").strip()
+                if generated.startswith("好的") or generated.startswith("下面") or generated.startswith("作为"):
+                    non_empty_lines = [line.strip() for line in generated.splitlines() if line.strip()]
+                    if len(non_empty_lines) > 1:
+                        generated = "\n".join(non_empty_lines[1:]).strip()
+                generated = self._repair_action_plan(
+                    candidate=candidate,
+                    strategy=strategy,
+                    market_snapshot=market_snapshot,
+                    us_snapshot=us_snapshot,
+                    text=generated,
                 )
                 last_output = generated
                 if _picker_is_action_plan_usable(generated):
@@ -2784,6 +3315,7 @@ def _picker_run_scheduled_scan(self: StockPickerService) -> Dict[str, Any]:
             scan_date=scan_date,
             max_candidates=_MAX_SELECTED_CANDIDATES,
             send_notification=True,
+            recompute_market_snapshot=True,
         )
 
 
@@ -3203,6 +3735,7 @@ StockPickerService._score_intel_payload = _picker_score_intel_payload
 StockPickerService._derive_trade_levels = _picker_derive_trade_levels
 StockPickerService._build_stock_profile = _picker_build_stock_profile
 StockPickerService._picker_compact_review_text = _picker_compact_review_text
+StockPickerService._repair_action_plan = _picker_repair_action_plan
 StockPickerService._build_template_action_plan = _picker_build_template_action_plan
 StockPickerService._build_action_plan = _picker_build_action_plan
 StockPickerService._build_run_summary_markdown = _picker_build_run_summary_markdown
