@@ -51,6 +51,7 @@ _BUILTIN_STRATEGY_DIR = Path(__file__).resolve().parents[2] / "strategies"
 _ENRICHMENT_LOG_DIR = Path(__file__).resolve().parents[2] / "logs" / "picker_enrichment"
 _MAX_SELECTED_CANDIDATES = 10
 _MAX_REPORT_CANDIDATES = 5
+_RANKING_PREFILTER_CANDIDATES = 150
 CORE_SCHEDULED_STRATEGIES = ("swing_trend_follow", "main_force_breakout", "shanliu_theme_flow")
 _PICKER_STRATEGY_PRESETS: Dict[str, Dict[str, Any]] = {
     "mainboard_swing_master": {
@@ -262,7 +263,7 @@ class StrategySignal:
 class StockPickerService:
     """Quantitative scan + LLM review workflow for post-close stock picking."""
 
-    _scan_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="picker_scan")
+    _scan_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="picker_scan")
     _background_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="picker_bg")
     _schedule_lock = threading.Lock()
 
@@ -533,6 +534,10 @@ class StockPickerService:
                     "llm_model": None,
                 }
             )
+
+        if ranking_only_mode and len(candidates) > _RANKING_PREFILTER_CANDIDATES:
+            candidates.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+            candidates = candidates[:_RANKING_PREFILTER_CANDIDATES]
 
         for candidate in candidates:
             boards = self._get_candidate_board_context(str(candidate.get("code") or ""))
@@ -1043,7 +1048,12 @@ class StockPickerService:
             top_rows = candidate_rows[:_MAX_REPORT_CANDIDATES]
             if top_rows and any(self._is_placeholder_action_plan(row.action_plan_markdown) for row in top_rows):
                 run.status = "failed"
-                run.completed_at = None
+                run.completed_at = datetime.now()
+                run.summary_markdown = "扫描进程已中断：后台服务重启或旧任务超时，请重新发起选股。"
+            elif not candidate_rows and run.created_at <= datetime.now() - timedelta(minutes=10):
+                run.status = "failed"
+                run.completed_at = datetime.now()
+                run.summary_markdown = "扫描进程已中断：任务超过 10 分钟仍未写入候选，请重新发起选股。"
 
     def _repair_stale_runs(self, *, older_than_minutes: int = 10) -> None:
         cutoff = datetime.now() - timedelta(minutes=max(1, older_than_minutes))
