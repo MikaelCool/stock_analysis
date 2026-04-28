@@ -65,7 +65,11 @@ function Get-ProjectWebUiProcessInfo {
         if ($null -ne $processInfo.CommandLine) {
             $commandLine = [string]$processInfo.CommandLine
         }
-        if ($commandLine -like '*D:\codex\daily_stock_analysis*' -and $commandLine -like '*main.py*') {
+        $isProjectWebUi = (
+            ($commandLine -like '*D:\codex\daily_stock_analysis*' -and $commandLine -like '*main.py*') -or
+            ($commandLine -like '*main.py*' -and $commandLine -like '*--webui-only*' -and $commandLine -like '*--port 8000*')
+        )
+        if ($isProjectWebUi) {
             return [pscustomobject]@{
                 Id = [int]$connection.OwningProcess
                 CommandLine = $commandLine

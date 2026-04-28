@@ -29,9 +29,9 @@ catch {
 
 $existing = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
     $_.Name -eq 'python.exe' -and
-    $_.CommandLine -like '*D:\codex\daily_stock_analysis*' -and
     $_.CommandLine -like '*main.py*' -and
-    $_.CommandLine -like '*--webui-only*'
+    $_.CommandLine -like '*--webui-only*' -and
+    $_.CommandLine -like '*--port 8000*'
 }
 foreach ($proc in $existing) {
     try {
