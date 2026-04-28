@@ -473,6 +473,7 @@ class StockPickerService:
             strategy_params.update(optimized["params"])
         if strategy_params_override:
             strategy_params.update(strategy_params_override)
+        ranking_only_mode = strategy["strategy_id"] in CORE_SCHEDULED_STRATEGIES
 
         self._ensure_recent_market_data(scan_date, lookback_trading_days=90, force_refresh=force_refresh)
         universe = self._load_mainboard_universe()
@@ -499,8 +500,16 @@ class StockPickerService:
                 market_snapshot=market_snapshot,
                 params=strategy_params,
             )
-            if not signal.passed:
+            if not signal.passed and not ranking_only_mode:
                 continue
+            metrics = dict(signal.metrics or {})
+            metrics["strategy_rule_passed"] = bool(signal.passed)
+            analysis_summary = signal.analysis_summary
+            if ranking_only_mode and not signal.passed:
+                analysis_summary = (
+                    f"{item['name']} 未完全触发硬条件，但在 {strategy['name']} 全市场评分排序中靠前，"
+                    "适合作为次日重点观察候选。"
+                )
             candidates.append(
                 {
                     "code": code,
@@ -509,12 +518,12 @@ class StockPickerService:
                     "strategy_id": strategy["strategy_id"],
                     "setup_type": signal.setup_type,
                     "score": round(signal.score, 2),
-                    "operation_advice": signal.operation_advice,
-                    "analysis_summary": signal.analysis_summary,
+                    "operation_advice": signal.operation_advice if signal.passed else "观察",
+                    "analysis_summary": analysis_summary,
                     "reasons": signal.reasons,
                     "stop_loss": signal.stop_loss,
                     "take_profit": signal.take_profit,
-                    "metrics": signal.metrics,
+                    "metrics": metrics,
                     "news_context": None,
                     "market_context": {
                         "cn": market_snapshot,
@@ -555,8 +564,9 @@ class StockPickerService:
             metrics = candidate.setdefault("metrics", {})
             metrics["effective_min_score_threshold"] = effective_min_score
             metrics["theme_final_score"] = blended_score
+            metrics["ranking_only_mode"] = ranking_only_mode
             candidate["score"] = blended_score
-            if blended_score >= effective_min_score:
+            if ranking_only_mode or blended_score >= effective_min_score:
                 final_candidates.append(candidate)
 
         final_candidates.sort(key=lambda item: item["score"], reverse=True)
