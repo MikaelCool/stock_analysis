@@ -1588,6 +1588,16 @@ class StockPickerService:
         target = strategy_id or getattr(self.config, "stock_picker_default_strategy", "mainboard_swing_master")
         if target == "swing_after_close_picker":
             target = "mainboard_swing_master"
+        if target == "mainboard_swing_master":
+            preset = _PICKER_STRATEGY_PRESETS[target]
+            return {
+                "strategy_id": target,
+                "name": "主力波段双模",
+                "description": "旧版兼容策略：收盘后综合突破启动、趋势回踩、量能、消息面与市场情绪。",
+                "skill_id": "swing_after_close_picker",
+                "category": "swing",
+                "params": dict(preset.get("params") or {}),
+            }
         for item in self._strategy_catalog():
             if item["strategy_id"] == target:
                 return item
@@ -3541,13 +3551,6 @@ def _picker_build_strategy_catalog() -> List[Dict[str, Any]]:
             "skill_id": "shanliu_theme_flow",
             "category": "theme",
         },
-        {
-            "strategy_id": "mainboard_swing_master",
-            "name": "主力波段双模",
-            "description": "收盘后筛选沪深主板非 ST 标的，综合突破启动、趋势回踩、量能、消息面与市场情绪。",
-            "skill_id": "swing_after_close_picker",
-            "category": "swing",
-        },
     ]
     catalog: List[Dict[str, Any]] = []
     seen = set()
@@ -3564,6 +3567,8 @@ def _picker_build_strategy_catalog() -> List[Dict[str, Any]]:
 
     for skill in skills:
         strategy_id = "mainboard_swing_master" if skill.name == "swing_after_close_picker" else skill.name
+        if strategy_id == "mainboard_swing_master":
+            continue
         if strategy_id in seen:
             continue
         preset = _PICKER_STRATEGY_PRESETS.get(strategy_id)
