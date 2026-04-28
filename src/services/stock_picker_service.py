@@ -51,7 +51,7 @@ _BUILTIN_STRATEGY_DIR = Path(__file__).resolve().parents[2] / "strategies"
 _ENRICHMENT_LOG_DIR = Path(__file__).resolve().parents[2] / "logs" / "picker_enrichment"
 _MAX_SELECTED_CANDIDATES = 10
 _MAX_REPORT_CANDIDATES = 5
-_RANKING_PREFILTER_CANDIDATES = 150
+_RANKING_PREFILTER_CANDIDATES = 5
 CORE_SCHEDULED_STRATEGIES = ("swing_trend_follow", "main_force_breakout", "shanliu_theme_flow")
 _PICKER_STRATEGY_PRESETS: Dict[str, Dict[str, Any]] = {
     "mainboard_swing_master": {

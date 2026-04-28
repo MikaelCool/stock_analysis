@@ -191,10 +191,10 @@ const StockPickerPage: React.FC = () => {
     try {
       const detail = await stockPickerApi.scan({
         strategyId: selectedStrategy,
-        maxCandidates: 10,
+        maxCandidates: 5,
         strategyParams: normalizeOutgoingParams(strategyParams),
         sendNotification: true,
-        forceRefresh: true,
+        forceRefresh: false,
       });
       setSelectedRunId(detail.id);
       setSelectedRun(detail);
