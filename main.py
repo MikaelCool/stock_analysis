@@ -777,7 +777,7 @@ def _build_stock_picker_schedule_checker():
         if state["last_trigger_key"] == trigger_key:
             return
 
-        logger.info("触发定时选股任务: strategy=mainboard_swing_master time=%s", schedule_time)
+        logger.info("触发定时选股任务: strategies=swing_trend_follow,main_force_breakout,shanliu_theme_flow time=%s", schedule_time)
         picker.run_scheduled_scan()
         state["last_trigger_key"] = trigger_key
 
@@ -807,15 +807,11 @@ def _build_stock_picker_optimization_checker():
 
         now = get_market_now("cn")
         today = now.date()
+        if today.weekday() != 5:
+            return
+
         picker = StockPickerService(config=runtime_config)
         effective_trade_date = picker._resolve_scan_trade_date()
-
-        # 周五收盘后触发一次；周末再次补跑一次，确保服务在周末启动时也会完成优化。
-        if today.weekday() < 5:
-            if today.weekday() != 4:
-                return
-            if effective_trade_date != today:
-                return
 
         schedule_hour, schedule_minute = (int(part) for part in schedule_time.split(":", 1))
         scheduled_at = now.replace(hour=schedule_hour, minute=schedule_minute, second=0, microsecond=0)
@@ -827,11 +823,15 @@ def _build_stock_picker_optimization_checker():
             return
 
         logger.info(
-            "触发周度选股优化任务: effective_trade_date=%s schedule_time=%s",
+            "触发周六策略优化任务: effective_trade_date=%s schedule_time=%s",
             effective_trade_date,
             schedule_time,
         )
-        result = picker.run_weekly_optimization(lookback_days=90, max_candidates=3000)
+        result = picker.run_weekly_optimization(
+            lookback_days=90,
+            max_candidates=3000,
+            send_notification=True,
+        )
         logger.info(
             "周度选股优化完成: backtest=%s strategies=%s",
             result.get("backtest_stats"),
@@ -863,7 +863,7 @@ def start_stock_picker_schedule_background() -> None:
     thread = threading.Thread(target=_runner, daemon=True, name="stock-picker-schedule")
     thread.start()
     logger.info(
-        "收盘后选股后台调度已启动，默认执行时间: %s；周度优化时间: %s",
+        "收盘后选股后台调度已启动，默认执行时间: %s；周六策略优化时间: %s",
         getattr(get_config(), "stock_picker_schedule_time", "16:00"),
         getattr(get_config(), "stock_picker_optimization_schedule_time", "16:20"),
     )

@@ -27,6 +27,21 @@ try {
 catch {
 }
 
+$existing = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    $_.Name -eq 'python.exe' -and
+    $_.CommandLine -like '*D:\codex\daily_stock_analysis*' -and
+    $_.CommandLine -like '*main.py*' -and
+    $_.CommandLine -like '*--webui-only*'
+}
+foreach ($proc in $existing) {
+    try {
+        Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
+        Start-Sleep -Milliseconds 500
+    }
+    catch {
+    }
+}
+
 $proc = Start-Process `
     -FilePath $pythonExe `
     -ArgumentList 'main.py','--webui-only','--host','0.0.0.0','--port','8000' `

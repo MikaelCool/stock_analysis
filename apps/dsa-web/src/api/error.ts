@@ -392,7 +392,18 @@ export function parseApiError(error: unknown): ParsedApiError {
     });
   }
 
-  if (includesAny(matchText, ['timeout', 'timed out', 'read timeout', 'connect timeout']) || code === 'ECONNABORTED') {
+  const localRequestTimeout = !response && code === 'ECONNABORTED';
+  if (localRequestTimeout) {
+    return createParsedApiError({
+      title: '选股请求等待超时',
+      message: '浏览器等待选股结果超时。本次扫描可能仍在后台继续执行，请稍后到 Runs 列表刷新查看结果。',
+      rawMessage,
+      status,
+      category: 'upstream_timeout',
+    });
+  }
+
+  if (includesAny(matchText, ['timeout', 'timed out', 'read timeout', 'connect timeout'])) {
     return createParsedApiError({
       title: '连接上游服务超时',
       message: '服务端访问外部依赖时超时，请稍后重试，或检查当前网络与代理设置。',

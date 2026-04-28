@@ -1350,13 +1350,15 @@ class GeminiAnalyzer:
             Response text, or None if the LLM call fails (error is logged).
         """
         try:
+            generation_config = {
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            }
+            if timeout_seconds is not None:
+                generation_config["timeout_seconds"] = timeout_seconds
             result = self._call_litellm(
                 prompt,
-                generation_config={
-                    "max_tokens": max_tokens,
-                    "temperature": temperature,
-                    "timeout_seconds": timeout_seconds,
-                },
+                generation_config=generation_config,
             )
             if isinstance(result, tuple):
                 text, model_used, usage = result

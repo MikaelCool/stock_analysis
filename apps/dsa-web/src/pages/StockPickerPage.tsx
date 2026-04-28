@@ -5,7 +5,6 @@ import remarkGfm from 'remark-gfm';
 import { Button, Card, EmptyState, InlineAlert, Input, Select } from '../components/common';
 import {
   stockPickerApi,
-  type PickerBacktest,
   type PickerCandidate,
   type PickerRun,
   type PickerStrategyOption,
@@ -17,6 +16,19 @@ const PARAM_LABELS: Record<string, string> = {
   min_score_threshold: '最低分数',
   volume_spike_multiplier: '倍量系数',
   max_ma20_distance_pct: '距 MA20 最大偏离',
+  max_ma5_distance_pct: '距 MA5 最大偏离',
+  market_score_floor: 'A股情绪分下限',
+  preferred_setup_type: '偏好形态',
+  pullback_min_score_threshold: '回踩-最低分数',
+  pullback_volume_spike_multiplier: '回踩-倍量系数',
+  pullback_max_ma20_distance_pct: '回踩-距 MA20',
+  pullback_max_ma5_distance_pct: '回踩-距 MA5',
+  pullback_market_score_floor: '回踩-A股情绪分',
+  breakout_min_score_threshold: '突破-最低分数',
+  breakout_volume_spike_multiplier: '突破-倍量系数',
+  breakout_max_ma20_distance_pct: '突破-距 MA20',
+  breakout_max_ma5_distance_pct: '突破-距 MA5',
+  breakout_market_score_floor: '突破-A股情绪分',
 };
 
 const PARAM_HINTS: Record<string, string> = {
@@ -40,14 +52,21 @@ const METRIC_LABELS: Record<string, string> = {
   avg_return_pct: '平均收益',
   win_rate_pct: '胜率',
   objective: '目标值',
+  median_return_pct: '收益中位数',
+  loss_rate_pct: '亏损率',
+  high_drawdown_rate_pct: '高回撤率',
+  tail_loss_rate_pct: '尾部亏损率',
+  profit_factor: '盈亏因子',
+  llm_summary: 'LLM 总结',
 };
 
-const PENDING_STATUSES = new Set(['queued', 'enriching']);
+const PENDING_STATUSES = new Set(['queued', 'running', 'enriching']);
 
 const StockPickerPage: React.FC = () => {
   const [strategies, setStrategies] = useState<PickerStrategyOption[]>([]);
   const [runs, setRuns] = useState<PickerRun[]>([]);
   const [selectedRun, setSelectedRun] = useState<PickerRun | null>(null);
+  const [selectedRunId, setSelectedRunId] = useState<number | null>(null);
   const [selectedStrategy, setSelectedStrategy] = useState('');
   const [strategyParams, setStrategyParams] = useState<StrategyParamValues>({});
   const [loading, setLoading] = useState(true);
@@ -112,9 +131,15 @@ const StockPickerPage: React.FC = () => {
       setStrategies(nextStrategies);
       setSelectedStrategy((prev) => prev || nextStrategies[0]?.strategyId || '');
       setRuns(nextRuns);
-      if (nextRuns[0]) {
-        setSelectedRun(await stockPickerApi.getRun(nextRuns[0].id));
+      const preferredRunId =
+        selectedRunId !== null && nextRuns.some((item) => item.id === selectedRunId)
+          ? selectedRunId
+          : nextRuns[0]?.id ?? null;
+      if (preferredRunId !== null) {
+        setSelectedRunId(preferredRunId);
+        setSelectedRun(await stockPickerApi.getRun(preferredRunId));
       } else {
+        setSelectedRunId(null);
         setSelectedRun(null);
       }
     } catch (err) {
@@ -133,6 +158,7 @@ const StockPickerPage: React.FC = () => {
         stockPickerApi.getRun(runId),
         stockPickerApi.listRuns(),
       ]);
+      setSelectedRunId(runId);
       setSelectedRun(detail);
       setRuns(nextRuns);
     } catch (err) {
@@ -168,9 +194,12 @@ const StockPickerPage: React.FC = () => {
         maxCandidates: 10,
         strategyParams: normalizeOutgoingParams(strategyParams),
         sendNotification: true,
+        forceRefresh: true,
       });
+      setSelectedRunId(detail.id);
       setSelectedRun(detail);
       setRuns(await stockPickerApi.listRuns());
+      setSelectedRun(await stockPickerApi.getRun(detail.id));
     } catch (err) {
       setError(err instanceof Error ? err.message : '选股扫描失败');
     } finally {
@@ -262,7 +291,7 @@ const StockPickerPage: React.FC = () => {
                   type="button"
                   onClick={() => void refreshSelectedRun(run.id)}
                   className={`rounded-2xl border px-4 py-3 text-left transition-colors ${
-                    selectedRun?.id === run.id
+                    selectedRunId === run.id
                       ? 'border-cyan/40 bg-cyan/10'
                       : 'border-border/60 bg-card/50 hover:bg-hover'
                   }`}
@@ -371,14 +400,60 @@ const StatusBadge: React.FC<{ status: string }> = ({ status }) => {
   );
 };
 
+const getSectorLabel = (value: unknown): string | null => {
+  if (!value || typeof value !== 'object') return null;
+  const record = value as Record<string, unknown>;
+  const name = typeof record.name === 'string' ? record.name : '';
+  if (!name) return null;
+  const rank = typeof record.rank === 'number' ? record.rank : null;
+  const source = typeof record.source === 'string' ? record.source : '';
+  const suffix = source === 'peer_capital_proxy'
+    ? '资金代理'
+    : source === 'peer_momentum'
+      ? '候选共振'
+      : '官方板块';
+  return rank ? `${name} · #${rank} · ${suffix}` : `${name} · ${suffix}`;
+};
+
 const CandidateCard: React.FC<{ candidate: PickerCandidate }> = ({ candidate }) => (
   <Card
     title={`${candidate.rank}. ${candidate.name} (${candidate.code})`}
     subtitle={`${candidate.setupType} | score ${candidate.score}`}
   >
-    <div className="grid gap-4 xl:grid-cols-[1.15fr_0.85fr]">
+    <div className="grid gap-4 xl:grid-cols-[minmax(0,1.45fr)_320px]">
       <div className="space-y-3">
         <p className="text-sm leading-6 text-secondary-text">{candidate.analysisSummary}</p>
+        {Array.isArray(candidate.metrics?.themeBoards) && candidate.metrics.themeBoards.length ? (
+          <div className="space-y-2">
+            <p className="text-xs uppercase tracking-[0.18em] text-secondary-text/80">所属板块</p>
+            <div className="flex flex-wrap gap-2">
+              {candidate.metrics.themeBoards.slice(0, 6).map((board: unknown) => (
+                <span
+                  key={String(board)}
+                  className="rounded-full border border-border/60 bg-card/60 px-3 py-1 text-xs text-secondary-text"
+                >
+                  {String(board)}
+                </span>
+              ))}
+            </div>
+          </div>
+        ) : null}
+        {getSectorLabel(candidate.metrics?.themeHotSector) || getSectorLabel(candidate.metrics?.themeHotCapitalSector) ? (
+          <div className="grid gap-2 md:grid-cols-2">
+            {getSectorLabel(candidate.metrics?.themeHotSector) ? (
+              <div className="rounded-2xl border border-emerald-500/20 bg-emerald-500/8 px-3 py-2 text-xs text-emerald-300">
+                <span className="mr-2 text-[10px] uppercase tracking-[0.18em] text-emerald-200/80">强势板块</span>
+                {getSectorLabel(candidate.metrics?.themeHotSector)}
+              </div>
+            ) : null}
+            {getSectorLabel(candidate.metrics?.themeHotCapitalSector) ? (
+              <div className="rounded-2xl border border-cyan/20 bg-cyan/10 px-3 py-2 text-xs text-cyan">
+                <span className="mr-2 text-[10px] uppercase tracking-[0.18em] text-cyan/80">资金板块</span>
+                {getSectorLabel(candidate.metrics?.themeHotCapitalSector)}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
         {candidate.reasons.length ? (
           <div className="flex flex-wrap gap-2">
             {candidate.reasons.map((reason) => (
@@ -404,72 +479,64 @@ const CandidateCard: React.FC<{ candidate: PickerCandidate }> = ({ candidate }) 
       </div>
 
       <div className="space-y-3">
-        <Card title="回测" subtitle="T+1 / T+3 / T+5 / T+10" padding="sm">
-          {candidate.backtests.length ? (
-            <BacktestTable backtests={candidate.backtests} />
-          ) : (
-            <p className="text-sm text-secondary-text">回测数据尚未完成。</p>
-          )}
-        </Card>
-
-        <Card title="指标快照" subtitle="Metrics" padding="sm">
-          <MetricsTable entries={objectEntries(candidate.metrics)} />
+        <Card title="指标快照" subtitle="关键信息" padding="sm">
+          <MetricsSummary metrics={candidate.metrics} />
         </Card>
       </div>
     </div>
   </Card>
 );
 
-const BacktestTable: React.FC<{ backtests: PickerBacktest[] }> = ({ backtests }) => (
-  <div className="overflow-hidden rounded-2xl border border-border/60">
-    <table className="w-full border-collapse text-sm">
-      <thead className="bg-card/80 text-secondary-text">
-        <tr>
-          <th className="px-3 py-2 text-left font-medium">周期</th>
-          <th className="px-3 py-2 text-left font-medium">收益</th>
-          <th className="px-3 py-2 text-left font-medium">最大回撤</th>
-          <th className="px-3 py-2 text-left font-medium">结果</th>
-        </tr>
-      </thead>
-      <tbody>
-        {backtests.map((backtest) => (
-          <tr key={backtest.id} className="border-t border-border/60">
-            <td className="px-3 py-3">T+{backtest.horizonDays}</td>
-            <td className={`px-3 py-3 ${Number(backtest.returnPct || 0) >= 0 ? 'text-success' : 'text-danger'}`}>
-              {formatCellValue(backtest.returnPct, '%')}
-            </td>
-            <td className="px-3 py-3">{formatCellValue(backtest.maxDrawdownPct, '%')}</td>
-            <td className="px-3 py-3 text-secondary-text">{backtest.outcome || backtest.status}</td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
-  </div>
-);
+const METRIC_HIGHLIGHT_KEYS = [
+  'themeStrengthLabel',
+  'themePrimaryBoards',
+  'themeHotSector',
+  'themeHotCapitalSector',
+  'themeScoreDelta',
+  'themeFinalScore',
+  'stockMainNetInflow',
+  'marketScore',
+  'pctChg',
+  'amountRatio',
+  'volumeSpikeFactor',
+  'distanceToMa20Pct',
+  'distanceToMa5Pct',
+  'atrPct',
+  'institutionStyle',
+  'weakMoneyFollow',
+] as const;
 
-const MetricsTable: React.FC<{ entries: Array<[string, unknown]> }> = ({ entries }) => {
+const MetricsSummary: React.FC<{ metrics: Record<string, unknown> }> = ({ metrics }) => {
+  const entries = buildMetricHighlights(metrics);
   if (!entries.length) {
     return <p className="text-sm text-secondary-text">暂无指标快照。</p>;
   }
 
   return (
-    <div className="overflow-hidden rounded-2xl border border-border/60">
-      <table className="w-full border-collapse text-sm">
-        <thead className="bg-card/80 text-secondary-text">
-          <tr>
-            <th className="px-3 py-2 text-left font-medium">指标</th>
-            <th className="px-3 py-2 text-left font-medium">数值</th>
-          </tr>
-        </thead>
-        <tbody>
-          {entries.map(([key, value]) => (
-            <tr key={key} className="border-t border-border/60">
-              <td className="px-3 py-3 font-medium text-foreground">{METRIC_LABELS[key] ?? key}</td>
-              <td className="px-3 py-3 text-secondary-text">{formatCellValue(value)}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+    <div className="space-y-2 rounded-2xl border border-border/60 bg-card/40 px-3 py-3">
+      {entries.map(([label, value]) => (
+        <div key={label} className="border-b border-border/40 pb-2 last:border-b-0 last:pb-0">
+          <p className="text-[11px] uppercase tracking-[0.16em] text-secondary-text">{label}</p>
+          <p className="mt-1 text-sm leading-6 text-foreground">{value}</p>
+        </div>
+      ))}
+    </div>
+  );
+};
+
+const MetricsTable: React.FC<{ entries: Array<[string, string]> }> = ({ entries }) => {
+  if (!entries.length) {
+    return <p className="text-sm text-secondary-text">暂无数据。</p>;
+  }
+
+  return (
+    <div className="space-y-2 rounded-2xl border border-border/60 bg-card/40 px-3 py-3">
+      {entries.map(([label, value]) => (
+        <div key={label} className="border-b border-border/40 pb-2 last:border-b-0 last:pb-0">
+          <p className="text-[11px] uppercase tracking-[0.16em] text-secondary-text">{label}</p>
+          <p className="mt-1 text-sm leading-6 text-foreground">{value}</p>
+        </div>
+      ))}
     </div>
   );
 };
@@ -506,6 +573,72 @@ const OptimizationSummaryCard: React.FC<{
             <MetricsTable entries={summary.metrics} />
           </div>
         ) : null}
+
+        {summary.diagnosisSummary ? (
+          <div className="space-y-2">
+            <p className="text-sm font-semibold text-foreground">LLM 复盘结论</p>
+            <p className="text-sm leading-6 text-secondary-text">{summary.diagnosisSummary}</p>
+          </div>
+        ) : null}
+
+        {summary.parameterAdjustments.length ? (
+          <div className="space-y-2">
+            <p className="text-sm font-semibold text-foreground">参数调整建议</p>
+            <div className="space-y-2">
+              {summary.parameterAdjustments.map((item) => (
+                <div key={`${item.name}-${item.direction}`} className="rounded-2xl border border-border/60 bg-card/50 px-4 py-3">
+                  <p className="text-sm font-medium text-foreground">
+                    {item.name} · {item.direction}
+                  </p>
+                  <p className="mt-1 text-sm leading-6 text-secondary-text">{item.rationale}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null}
+
+        {summary.factorHypotheses.length ? (
+          <div className="space-y-2">
+            <p className="text-sm font-semibold text-foreground">新因子假设</p>
+            <div className="space-y-2">
+              {summary.factorHypotheses.map((item) => (
+                <div key={item.factor} className="rounded-2xl border border-border/60 bg-card/50 px-4 py-3">
+                  <p className="text-sm font-medium text-foreground">{item.factor}</p>
+                  <p className="mt-1 text-sm leading-6 text-secondary-text">{item.hypothesis}</p>
+                  <p className="mt-1 text-xs text-secondary-text">预期效果：{item.expectedEffect}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null}
+
+        {summary.controlRules.length ? (
+          <div className="space-y-2">
+            <p className="text-sm font-semibold text-foreground">控制规则</p>
+            <div className="space-y-2">
+              {summary.controlRules.map((item) => (
+                <p key={item} className="rounded-2xl border border-border/60 bg-card/50 px-4 py-3 text-sm leading-6 text-secondary-text">
+                  {item}
+                </p>
+              ))}
+            </div>
+          </div>
+        ) : null}
+
+        {summary.nextWeekExperiments.length ? (
+          <div className="space-y-2">
+            <p className="text-sm font-semibold text-foreground">下周实验计划</p>
+            <div className="space-y-2">
+              {summary.nextWeekExperiments.map((item) => (
+                <div key={item.experiment} className="rounded-2xl border border-border/60 bg-card/50 px-4 py-3">
+                  <p className="text-sm font-medium text-foreground">{item.experiment}</p>
+                  <p className="mt-1 text-sm text-secondary-text">成功指标：{item.successMetric}</p>
+                  <p className="mt-1 text-sm text-secondary-text">停止条件：{item.stopCondition}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null}
       </>
     ) : (
       <EmptyState
@@ -540,6 +673,22 @@ function objectEntries(input: unknown): Array<[string, unknown]> {
   return Object.entries(input as Record<string, unknown>);
 }
 
+function buildMetricHighlights(metrics: Record<string, unknown> | undefined): Array<[string, string]> {
+  if (!metrics) {
+    return [];
+  }
+  return METRIC_HIGHLIGHT_KEYS
+    .map((key) => {
+      const value = metrics[key];
+      const rendered = formatMetricSummaryValue(key, value);
+      if (!rendered) {
+        return null;
+      }
+      return [METRIC_LABELS[key] ?? key, rendered] as [string, string];
+    })
+    .filter((item): item is [string, string] => Boolean(item));
+}
+
 function formatCellValue(value: unknown, suffix = ''): string {
   if (value == null) {
     return '-';
@@ -557,12 +706,58 @@ function formatCellValue(value: unknown, suffix = ''): string {
   return JSON.stringify(value);
 }
 
+function formatMetricSummaryValue(key: string, value: unknown): string | null {
+  if (value == null || value === '') {
+    return null;
+  }
+  if (key === 'themePrimaryBoards' && Array.isArray(value)) {
+    const boards = value.map((item) => String(item)).filter(Boolean);
+    return boards.length ? boards.join(' / ') : null;
+  }
+  if (key === 'themeHotSector' || key === 'themeHotCapitalSector') {
+    return getSectorLabel(value);
+  }
+  if (key === 'stockMainNetInflow' && typeof value === 'number') {
+    return formatMoneyFlow(value);
+  }
+  if (key === 'themeScoreDelta' || key === 'pctChg' || key === 'distanceToMa20Pct' || key === 'distanceToMa5Pct' || key === 'atrPct') {
+    return `${Number(value).toFixed(2)}%`;
+  }
+  if (key === 'amountRatio' || key === 'volumeSpikeFactor' || key === 'themeFinalScore' || key === 'marketScore') {
+    return Number(value).toFixed(2);
+  }
+  if (typeof value === 'boolean') {
+    return value ? '是' : '否';
+  }
+  if (typeof value === 'number') {
+    return Number.isInteger(value) ? String(value) : value.toFixed(2);
+  }
+  if (typeof value === 'string') {
+    return value;
+  }
+  return null;
+}
+
+function formatMoneyFlow(value: number): string {
+  const absValue = Math.abs(value);
+  if (absValue >= 100000000) {
+    return `${(value / 100000000).toFixed(2)} 亿元`;
+  }
+  if (absValue >= 10000) {
+    return `${(value / 10000).toFixed(2)} 万元`;
+  }
+  return `${value.toFixed(0)} 元`;
+}
+
 function formatRunStatus(status: string): string {
   if (status === 'completed') {
     return '已完成';
   }
   if (status === 'failed') {
     return '失败';
+  }
+  if (status === 'running') {
+    return '扫描中';
   }
   if (status === 'enriching') {
     return '补充中';
@@ -578,12 +773,15 @@ function buildOptimizationSummary(optimization: unknown) {
   const optimizationObject = Object.fromEntries(entries);
   const params = objectEntries(optimizationObject.params);
   const metrics = objectEntries(optimizationObject.metrics);
+  const llmReview = optimizationObject.llm_review as Record<string, unknown> | undefined;
+  const metricsObject = (optimizationObject.metrics as Record<string, unknown> | undefined) ?? {};
   const status = typeof optimizationObject.status === 'string' ? optimizationObject.status : 'unknown';
-  const sampleCount = Number((optimizationObject.metrics as Record<string, unknown> | undefined)?.sample_count ?? 0);
+  const sampleCount = Number(metricsObject.sample_count ?? 0);
   const lookbackDays = Number(optimizationObject.lookback_days ?? 0);
   const horizonDays = Number(optimizationObject.selected_horizon_days ?? 0);
-  const avgReturn = Number((optimizationObject.metrics as Record<string, unknown> | undefined)?.avg_return_pct ?? 0);
-  const winRate = Number((optimizationObject.metrics as Record<string, unknown> | undefined)?.win_rate_pct ?? 0);
+  const avgReturn = Number(metricsObject.avg_return_pct ?? 0);
+  const winRate = Number(metricsObject.win_rate_pct ?? 0);
+  const llmSummaryRaw = typeof metricsObject.llm_summary === 'string' ? metricsObject.llm_summary : '';
 
   const paragraphs: string[] = [];
   if (status === 'completed') {
@@ -600,7 +798,28 @@ function buildOptimizationSummary(optimization: unknown) {
     paragraphs.push('优化任务尚未形成稳定结论，建议继续积累样本后再观察。');
   }
 
-  paragraphs.push('前 5 只候选股的 T+1 / T+3 / T+5 / T+10 回测已经展示在每只股票卡片右侧，更适合直接复核单票表现。');
+  const keyParamOrder = [
+    'preferred_setup_type',
+    'min_score_threshold',
+    'volume_spike_multiplier',
+    'max_ma20_distance_pct',
+    'market_score_floor',
+    'pullback_min_score_threshold',
+    'breakout_min_score_threshold',
+  ];
+  const keyMetricOrder = [
+    'avg_return_pct',
+    'win_rate_pct',
+    'avg_max_drawdown_pct',
+    'worst_drawdown_pct',
+    'profit_factor',
+  ];
+
+  const paramsMap = new Map(params);
+  const metricsMap = new Map(metrics);
+  const diagnosisSummary = sanitizeOptimizationNarrative(
+    typeof llmReview?.diagnosis_summary === 'string' ? llmReview.diagnosis_summary : llmSummaryRaw,
+  );
 
   return {
     available: entries.length > 0,
@@ -610,9 +829,116 @@ function buildOptimizationSummary(optimization: unknown) {
     lookbackDays: Number.isFinite(lookbackDays) && lookbackDays > 0 ? lookbackDays : 90,
     horizonDays: Number.isFinite(horizonDays) && horizonDays > 0 ? horizonDays : 5,
     paragraphs,
-    params: params.map(([key, value]) => [PARAM_LABELS[key] ?? key, formatCellValue(value)] as [string, string]),
-    metrics: metrics.map(([key, value]) => [METRIC_LABELS[key] ?? key, formatCellValue(value)] as [string, string]),
+    params: keyParamOrder
+      .filter((key) => paramsMap.has(key))
+      .slice(0, 4)
+      .map((key) => [PARAM_LABELS[key] ?? key, formatCellValue(paramsMap.get(key))] as [string, string]),
+    metrics: keyMetricOrder
+      .filter((key) => metricsMap.has(key))
+      .slice(0, 4)
+      .map((key) => [METRIC_LABELS[key] ?? key, formatCellValue(metricsMap.get(key))] as [string, string]),
+    diagnosisSummary,
+    parameterAdjustments: normalizeReviewAdjustments(llmReview?.parameter_adjustments),
+    factorHypotheses: normalizeFactorHypotheses(llmReview?.factor_hypotheses),
+    controlRules: normalizeStringList(llmReview?.control_rules),
+    nextWeekExperiments: normalizeExperiments(llmReview?.next_week_experiments),
   };
+}
+
+function sanitizeOptimizationNarrative(value: string): string {
+  const raw = String(value || '').trim();
+  if (!raw) {
+    return '';
+  }
+  let normalized = raw;
+  if ((normalized.startsWith('{') && normalized.endsWith('}')) || (normalized.startsWith('[') && normalized.endsWith(']'))) {
+    try {
+      const parsed = JSON.parse(normalized) as Record<string, unknown>;
+      if (typeof parsed.summary === 'string') {
+        normalized = parsed.summary;
+      } else if (typeof parsed.diagnosis_summary === 'string') {
+        normalized = parsed.diagnosis_summary;
+      } else {
+        normalized = '';
+      }
+    } catch {
+      normalized = normalized.replace(/^[\[{]\s*/, '').replace(/\s*[\]}]$/, '');
+    }
+  }
+  normalized = normalized
+    .replace(/```json|```/gi, ' ')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/^["']|["']$/g, '')
+    .trim();
+  if (normalized.length > 180) {
+    normalized = `${normalized.slice(0, 180).trim()}...`;
+  }
+  return normalized;
+}
+
+function normalizeReviewAdjustments(value: unknown) {
+  if (!Array.isArray(value)) {
+    return [] as Array<{ name: string; direction: string; rationale: string }>;
+  }
+  return value
+    .map((item) => {
+      if (!item || typeof item !== 'object') {
+        return null;
+      }
+      const record = item as Record<string, unknown>;
+      return {
+        name: String(record.name ?? ''),
+        direction: String(record.direction ?? ''),
+        rationale: String(record.rationale ?? ''),
+      };
+    })
+    .filter((item): item is { name: string; direction: string; rationale: string } => Boolean(item?.name));
+}
+
+function normalizeFactorHypotheses(value: unknown) {
+  if (!Array.isArray(value)) {
+    return [] as Array<{ factor: string; hypothesis: string; expectedEffect: string }>;
+  }
+  return value
+    .map((item) => {
+      if (!item || typeof item !== 'object') {
+        return null;
+      }
+      const record = item as Record<string, unknown>;
+      return {
+        factor: String(record.factor ?? ''),
+        hypothesis: String(record.hypothesis ?? ''),
+        expectedEffect: String(record.expected_effect ?? ''),
+      };
+    })
+    .filter((item): item is { factor: string; hypothesis: string; expectedEffect: string } => Boolean(item?.factor));
+}
+
+function normalizeExperiments(value: unknown) {
+  if (!Array.isArray(value)) {
+    return [] as Array<{ experiment: string; successMetric: string; stopCondition: string }>;
+  }
+  return value
+    .map((item) => {
+      if (!item || typeof item !== 'object') {
+        return null;
+      }
+      const record = item as Record<string, unknown>;
+      return {
+        experiment: String(record.experiment ?? ''),
+        successMetric: String(record.success_metric ?? ''),
+        stopCondition: String(record.stop_condition ?? ''),
+      };
+    })
+    .filter((item): item is { experiment: string; successMetric: string; stopCondition: string } => Boolean(item?.experiment));
+}
+
+function normalizeStringList(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.map((item) => String(item ?? '').trim()).filter(Boolean);
 }
 
 function formatOptimizationStatus(status: string): string {

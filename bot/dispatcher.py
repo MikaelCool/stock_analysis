@@ -454,6 +454,16 @@ User: "analyze TSLA and NVDA using trend strategy"
 
         return bool(_extract_stock_code(stripped))
 
+    @staticmethod
+    def _is_bare_stock_code_message(text: str) -> bool:
+        stripped = (text or "").strip().upper()
+        return bool(
+            re.fullmatch(
+                r'(?:[036]\d{5}|(?:43|83|87|88|92)\d{4}|HK\d{5}|[A-Z]{1,5}(?:\.[A-Z]{1,2})?)',
+                stripped,
+            )
+        )
+
     async def _try_nl_routing(self, message: BotMessage) -> Optional[BotResponse]:
         """Route a non-command message to the appropriate command via LLM intent parsing.
 
@@ -472,21 +482,29 @@ User: "analyze TSLA and NVDA using trend strategy"
         from src.config import get_config
         config = get_config()
 
-        if not getattr(config, 'agent_nl_routing', False):
+        is_bare_stock_code = self._is_bare_stock_code_message(message.content)
+        if not getattr(config, 'agent_nl_routing', False) and not is_bare_stock_code:
             return None
 
-        # Only handle private chat or @mentioned messages to avoid hijacking
+        # Only handle private chat or @mentioned messages to avoid hijacking.
+        # A bare stock code in a Feishu group is an explicit analysis request.
         is_private = message.chat_type.value == "private"
-        if not is_private and not message.mentioned:
+        if not is_private and not message.mentioned and not is_bare_stock_code:
             return None
 
         # Keep Bot-side Agent entrypoints behind explicit opt-in so NL routing
         # cannot bypass AGENT_MODE=false.
-        if not getattr(config, 'agent_mode', False):
+        if not getattr(config, 'agent_mode', False) and not is_bare_stock_code:
             return None
 
         text = message.content.strip()
         if not text or len(text) > 500:
+            return None
+
+        if is_bare_stock_code:
+            analyze_cmd = self.get_command("analyze")
+            if analyze_cmd:
+                return await analyze_cmd.execute_async(message, [text.strip().upper(), "full"])
             return None
 
         # Layer 1: cheap pre-filter — skip obviously irrelevant messages
@@ -494,7 +512,10 @@ User: "analyze TSLA and NVDA using trend strategy"
             return None
 
         # Layer 2: LLM intent parsing — extract codes, intent, strategy
-        parsed = await self._parse_intent_via_llm(text, config)
+        if is_bare_stock_code:
+            parsed = {"intent": "analysis", "codes": [text.strip().upper()], "strategy": None}
+        else:
+            parsed = await self._parse_intent_via_llm(text, config)
         if parsed is None:
             return None
 
@@ -543,24 +564,34 @@ User: "analyze TSLA and NVDA using trend strategy"
         from src.config import get_config
 
         config = get_config()
-        if not getattr(config, 'agent_nl_routing', False):
+        is_bare_stock_code = self._is_bare_stock_code_message(message.content)
+        if not getattr(config, 'agent_nl_routing', False) and not is_bare_stock_code:
             return None
 
         is_private = message.chat_type.value == "private"
-        if not is_private and not message.mentioned:
+        if not is_private and not message.mentioned and not is_bare_stock_code:
             return None
 
-        if not getattr(config, 'agent_mode', False):
+        if not getattr(config, 'agent_mode', False) and not is_bare_stock_code:
             return None
 
         text = message.content.strip()
         if not text or len(text) > 500:
             return None
 
+        if is_bare_stock_code:
+            analyze_cmd = self.get_command("analyze")
+            if analyze_cmd:
+                return analyze_cmd.execute(message, [text.strip().upper(), "full"])
+            return None
+
         if not self._passes_nl_prefilter(text):
             return None
 
-        parsed = self._parse_intent_via_llm_sync(text, config)
+        if is_bare_stock_code:
+            parsed = {"intent": "analysis", "codes": [text.strip().upper()], "strategy": None}
+        else:
+            parsed = self._parse_intent_via_llm_sync(text, config)
         if parsed is None:
             return None
 

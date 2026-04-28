@@ -211,6 +211,10 @@ export const stockPickerApi = {
       strategy_params: payload.strategyParams ?? {},
       send_notification: payload.sendNotification ?? false,
       force_refresh: payload.forceRefresh ?? false,
+    }, {
+      // Full-market refresh on the first scan of the day can take minutes.
+      // Keep the request open so the browser does not abort a healthy scan.
+      timeout: 15 * 60 * 1000,
     });
     return toCamel<PickerRun>(response.data);
   },
