@@ -266,17 +266,29 @@ class StockPickerService:
     _scan_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="picker_scan")
     _background_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="picker_bg")
     _schedule_lock = threading.Lock()
+    _global_board_cache: Dict[str, List[Dict[str, Any]]] = {}
+    _global_board_cache_lock = threading.Lock()
 
     def __init__(
         self,
         db_manager: Optional[DatabaseManager] = None,
         *,
         config=None,
+        lightweight: bool = False,
     ) -> None:
         self.config = config or get_config()
         self.db = db_manager or DatabaseManager.get_instance()
-        self.fetcher_manager = DataFetcherManager()
+        self.lightweight = bool(lightweight)
+        self.fetcher_manager = None
         self.search_service = None
+        self.analyzer = None
+        self._board_cache: Dict[str, List[Dict[str, Any]]] = {}
+        self._sector_snapshot_cache: Dict[str, Dict[str, Any]] = {}
+        self._capital_flow_cache: Dict[str, Optional[float]] = {}
+        if self.lightweight:
+            return
+
+        self.fetcher_manager = DataFetcherManager()
         try:
             self.search_service = SearchService(
                 bocha_keys=self.config.bocha_api_keys,
@@ -293,9 +305,6 @@ class StockPickerService:
         except Exception as exc:
             logger.warning("Stock picker search service unavailable: %s", exc)
         self.analyzer = GeminiAnalyzer(config=self.config)
-        self._board_cache: Dict[str, List[Dict[str, Any]]] = {}
-        self._sector_snapshot_cache: Dict[str, Dict[str, Any]] = {}
-        self._capital_flow_cache: Dict[str, Optional[float]] = {}
 
     @staticmethod
     def list_strategies() -> List[Dict[str, Any]]:
@@ -539,15 +548,7 @@ class StockPickerService:
             candidates.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
             candidates = candidates[:_RANKING_PREFILTER_CANDIDATES]
 
-        for candidate in candidates:
-            boards = self._get_candidate_board_context(str(candidate.get("code") or ""))
-            board_names = [
-                str(item.get("name") or item.get("板块名称") or item.get("industry") or "").strip()
-                for item in boards
-                if str(item.get("name") or item.get("板块名称") or item.get("industry") or "").strip()
-            ]
-            candidate["_theme_board_names"] = board_names
-            candidate["_theme_primary_boards"] = self._select_theme_board_names(board_names)
+        self._attach_candidate_board_contexts(candidates)
 
         sector_snapshot = self._augment_sector_snapshot_with_candidates(sector_snapshot, candidates)
         self._apply_theme_strength(
@@ -664,6 +665,14 @@ class StockPickerService:
                 us_snapshot=payload.get("us_snapshot") or {},
                 optimization=payload.get("optimization"),
             )
+            if not payload.get("selected"):
+                service._update_run_status(run_id=run_id, status="completed", completed=True)
+                if send_notification:
+                    detail = service.get_run_detail(run_id)
+                    if detail is not None:
+                        detail["notification_stage"] = "scan_completed"
+                        service._send_scan_notification(detail)
+                return
             service._enqueue_run_enrichment(
                 run_id=run_id,
                 query_id=query_id,
@@ -755,6 +764,8 @@ class StockPickerService:
             ]
             top_rows = candidates[: min(len(candidates), _MAX_REPORT_CANDIDATES)]
             if (
+                not self.lightweight
+                and
                 run.status == "completed"
                 and top_rows
                 and any(self._is_placeholder_action_plan(row.action_plan_markdown) for row in top_rows)
@@ -1051,6 +1062,11 @@ class StockPickerService:
                 run.completed_at = datetime.now()
                 run.summary_markdown = "扫描进程已中断：后台服务重启或旧任务超时，请重新发起选股。"
             elif not candidate_rows and run.created_at <= datetime.now() - timedelta(minutes=10):
+                summary = str(run.summary_markdown or "")
+                if "今日没有符合条件的标的" in summary or "候选股" in summary:
+                    run.status = "completed"
+                    run.completed_at = datetime.now()
+                    return
                 run.status = "failed"
                 run.completed_at = datetime.now()
                 run.summary_markdown = "扫描进程已中断：任务超过 10 分钟仍未写入候选，请重新发起选股。"
@@ -2929,13 +2945,55 @@ class StockPickerService:
         cached = self._board_cache.get(normalized_code)
         if cached is not None:
             return cached
+        with self._global_board_cache_lock:
+            cached = self._global_board_cache.get(normalized_code)
+        if cached is not None:
+            self._board_cache[normalized_code] = cached
+            return cached
         try:
             boards = self.fetcher_manager.get_belong_boards(normalized_code) or []
         except Exception as exc:
             logger.debug("Stock picker belong boards unavailable for %s: %s", normalized_code, exc)
             boards = []
         self._board_cache[normalized_code] = boards
+        with self._global_board_cache_lock:
+            self._global_board_cache[normalized_code] = boards
         return boards
+
+    def _attach_candidate_board_contexts(self, candidates: List[Dict[str, Any]]) -> None:
+        if not candidates:
+            return
+
+        def load_boards(candidate: Dict[str, Any]) -> tuple[int, List[str]]:
+            idx = int(candidate.get("_board_attach_index") or 0)
+            boards = self._get_candidate_board_context(str(candidate.get("code") or ""))
+            board_names = [
+                str(item.get("name") or item.get("板块名称") or item.get("industry") or "").strip()
+                for item in boards
+                if str(item.get("name") or item.get("板块名称") or item.get("industry") or "").strip()
+            ]
+            return idx, board_names
+
+        for idx, candidate in enumerate(candidates):
+            candidate["_board_attach_index"] = idx
+
+        results: Dict[int, List[str]] = {}
+        worker_count = min(5, max(1, len(candidates)))
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="picker_board") as executor:
+            futures = [executor.submit(load_boards, candidate) for candidate in candidates]
+            for future in as_completed(futures):
+                try:
+                    idx, board_names = future.result()
+                except Exception as exc:
+                    logger.debug("Stock picker board context worker failed: %s", exc)
+                    continue
+                results[idx] = board_names
+
+        for idx, candidate in enumerate(candidates):
+            candidate.pop("_board_attach_index", None)
+            board_names = results.get(idx, [])
+            candidate["_theme_board_names"] = board_names
+            candidate["_theme_primary_boards"] = self._select_theme_board_names(board_names)
 
     @staticmethod
     def _select_theme_board_names(board_names: Sequence[str], *, max_items: int = 3) -> List[str]:
@@ -2991,7 +3049,14 @@ class StockPickerService:
             institution_style = bool(metrics.get("institution_style"))
             weak_money_follow = bool(metrics.get("weak_money_follow"))
             base_score = self._to_float(candidate.get("score"))
-            main_net_inflow = self._get_stock_main_net_inflow(str(candidate.get("code") or ""))
+            # Per-stock capital-flow calls are slow and can block the whole scan.
+            # Use cached/precomputed values only; sector capital rankings remain the
+            # primary money-flow signal for stock picking.
+            raw_main_net_inflow = metrics.get("stock_main_net_inflow")
+            try:
+                main_net_inflow = float(raw_main_net_inflow) if raw_main_net_inflow not in (None, "") else None
+            except (TypeError, ValueError):
+                main_net_inflow = None
             if main_net_inflow is not None:
                 metrics["stock_main_net_inflow"] = round(main_net_inflow, 2)
 

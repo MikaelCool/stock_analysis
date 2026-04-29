@@ -197,13 +197,13 @@ async def get_picker_strategies():
 
 @router.get("/runs", response_model=List[PickerRunSummary])
 async def list_picker_runs(limit: int = 20):
-    service = StockPickerService()
+    service = StockPickerService(lightweight=True)
     return [PickerRunSummary(**item) for item in service.list_runs(limit=limit)]
 
 
 @router.get("/runs/{run_id}", response_model=PickerRunDetail)
 async def get_picker_run(run_id: int):
-    service = StockPickerService()
+    service = StockPickerService(lightweight=True)
     payload = service.get_run_detail(run_id)
     if payload is None:
         raise HTTPException(status_code=404, detail="picker run not found")
@@ -249,7 +249,7 @@ async def get_picker_backtest_summary(
     scan_date_to: Optional[date] = None,
     top_n: int = 5,
 ):
-    service = StockPickerService()
+    service = StockPickerService(lightweight=True)
     return PickerBacktestSummaryResponse(
         **service.get_strategy_backtest_summary(
             strategy_id=strategy_id,
@@ -271,7 +271,7 @@ async def get_picker_backtest_results(
     page: int = 1,
     limit: int = 30,
 ):
-    service = StockPickerService()
+    service = StockPickerService(lightweight=True)
     return PickerBacktestResultsResponse(
         **service.get_strategy_backtest_results(
             strategy_id=strategy_id,
