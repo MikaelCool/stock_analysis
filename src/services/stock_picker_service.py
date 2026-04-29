@@ -51,7 +51,7 @@ _BUILTIN_STRATEGY_DIR = Path(__file__).resolve().parents[2] / "strategies"
 _ENRICHMENT_LOG_DIR = Path(__file__).resolve().parents[2] / "logs" / "picker_enrichment"
 _MAX_SELECTED_CANDIDATES = 10
 _MAX_REPORT_CANDIDATES = 5
-_RANKING_PREFILTER_CANDIDATES = 5
+_RANKING_PREFILTER_CANDIDATES = 30
 CORE_SCHEDULED_STRATEGIES = ("swing_trend_follow", "main_force_breakout", "shanliu_theme_flow")
 _PICKER_STRATEGY_PRESETS: Dict[str, Dict[str, Any]] = {
     "mainboard_swing_master": {
@@ -88,7 +88,7 @@ _PICKER_STRATEGY_PRESETS: Dict[str, Dict[str, Any]] = {
             "min_score_threshold": 73.0,
             "trend_follow_min_score_threshold": 73.0,
             "trend_follow_volume_spike_multiplier": 1.15,
-            "trend_follow_max_ma20_distance_pct": 13.0,
+            "trend_follow_max_ma20_distance_pct": 6.8,
             "trend_follow_max_ma5_distance_pct": 3.8,
             "trend_follow_market_score_floor": 46.0,
             "ma_gap_balance_limit_pct": 2.6,
@@ -513,6 +513,8 @@ class StockPickerService:
             if not signal.passed and not ranking_only_mode:
                 continue
             metrics = dict(signal.metrics or {})
+            if ranking_only_mode and metrics.get("hard_exclude"):
+                continue
             metrics["strategy_rule_passed"] = bool(signal.passed)
             analysis_summary = signal.analysis_summary
             if ranking_only_mode and not signal.passed:
@@ -568,6 +570,8 @@ class StockPickerService:
             )
             blended_score = round(float(candidate.get("score") or 0.0) * 0.86 + market_score_value * 0.14, 2)
             metrics = candidate.setdefault("metrics", {})
+            if metrics.get("hard_exclude"):
+                continue
             metrics["effective_min_score_threshold"] = effective_min_score
             metrics["theme_final_score"] = blended_score
             metrics["ranking_only_mode"] = ranking_only_mode
@@ -2136,6 +2140,32 @@ class StockPickerService:
         close_near_high = bool((high_price - close_price) / max(close_price, 0.01) * 100 <= 0.8)
         institution_style = bool(amount_ratio >= 1.1 and close_near_high and upper_shadow_pct <= 1.0 and body_pct >= 1.2)
         weak_money_follow = bool(upper_shadow_pct >= 1.8 and body_pct <= 1.0 and close_price < high_price * 0.99)
+        body_low = min(open_price, close_price)
+        body_high = max(open_price, close_price)
+        body_low_vs_ma20_pct = (body_low - ma20) / max(ma20, 0.01) * 100
+        low_vs_ma20_pct = (low_price - ma20) / max(ma20, 0.01) * 100
+        body_holds_ma20 = bool(body_low >= ma20 * 0.992 and close_price >= ma20 * 0.998)
+        wick_near_ma20 = bool(low_price >= ma20 * 0.965 and low_price <= ma20 * 1.025)
+        above_ma20_small_pullback = bool(
+            body_holds_ma20
+            and wick_near_ma20
+            and 0 <= distance_to_ma20_pct <= 5.5
+        )
+        rides_ma5_in_major_uptrend = bool(
+            close_price >= ma5 * 0.995
+            and body_low >= ma10 * 0.99
+            and distance_to_ma20_pct <= 6.8
+            and low_price >= ma20 * 0.985
+        )
+        major_uptrend = bool(
+            trend_stack_up
+            and ma60_up
+            and close_price >= ma60 * 1.01
+            and ma20 >= ma60 * 0.985
+            and ma30 >= ma60 * 0.965
+            and not bearish_trend
+        )
+        swing_pullback_quality = bool(above_ma20_small_pullback or rides_ma5_in_major_uptrend)
 
         reasons: List[str] = []
         score = 0.0
@@ -2262,9 +2292,9 @@ class StockPickerService:
 
         if strategy_id in {"mainboard_swing_master", "swing_trend_follow"}:
             trend_follow_mode = (
-                trend_stack_up
+                major_uptrend
+                and swing_pullback_quality
                 and orderly_ma_spacing
-                and ma60_up
                 and close_price >= ma5 * 0.985
                 and distance_to_ma5_pct <= trend_follow_max_ma5_distance_pct
                 and distance_to_ma20_pct <= trend_follow_max_ma20_distance_pct
@@ -2272,10 +2302,16 @@ class StockPickerService:
                 and macd_bull
                 and not weak_money_follow
             )
+            if strategy_id == "swing_trend_follow" and not major_uptrend:
+                score -= 45
+                reasons.append("整体趋势未确认向上：需 MA5>10>20>30、MA60 向上且股价站在 MA60 上方")
+            if strategy_id == "swing_trend_follow" and not swing_pullback_quality:
+                score -= 35
+                reasons.append("不是合格小级别回调：K线实体需守在 MA20 上方或贴近 MA20，不能明显跌破")
             if trend_follow_mode and (not passed or strategy_id == "swing_trend_follow"):
                 setup_type = "trend_follow"
                 score += 42
-                reasons.append("5/10/20/30日线多头上行且均线间隔有序，符合波段趋势跟随结构")
+                reasons.append("整体趋势向上，K线以小级别回调方式贴近 MA20/MA5 后承接")
             elif trend_follow_mode:
                 score += 8
                 reasons.append("均线间隔有序，趋势跟随结构加分")
@@ -2635,6 +2671,13 @@ class StockPickerService:
                     "institution_style": institution_style,
                     "weak_money_follow": weak_money_follow,
                     "trend_stack_up": trend_stack_up,
+                    "major_uptrend": major_uptrend,
+                    "swing_pullback_quality": swing_pullback_quality,
+                    "body_holds_ma20": body_holds_ma20,
+                    "wick_near_ma20": wick_near_ma20,
+                    "body_low_vs_ma20_pct": round(body_low_vs_ma20_pct, 2),
+                    "low_vs_ma20_pct": round(low_vs_ma20_pct, 2),
+                    "hard_exclude": bool(strategy_id == "swing_trend_follow" and not (major_uptrend and swing_pullback_quality)),
                     "ma20_up": ma20_up,
                     "ma60_up": ma60_up,
                     "top_divergence": top_divergence,
@@ -2681,6 +2724,13 @@ class StockPickerService:
                 "institution_style": institution_style,
                 "weak_money_follow": weak_money_follow,
                 "trend_stack_up": trend_stack_up,
+                "major_uptrend": major_uptrend,
+                "swing_pullback_quality": swing_pullback_quality,
+                "body_holds_ma20": body_holds_ma20,
+                "wick_near_ma20": wick_near_ma20,
+                "body_low_vs_ma20_pct": round(body_low_vs_ma20_pct, 2),
+                "low_vs_ma20_pct": round(low_vs_ma20_pct, 2),
+                "hard_exclude": False,
                 "ma20_up": ma20_up,
                 "ma60_up": ma60_up,
                 "macd_bull": macd_bull,
@@ -2787,6 +2837,28 @@ class StockPickerService:
         }
         for source, target in replacements.items():
             text = text.replace(source, target)
+        hot_theme_aliases = {
+            "锂电池": "电池",
+            "固态电池": "电池",
+            "钠离子电池": "电池",
+            "动力电池": "电池",
+            "电池技术": "电池",
+            "能源金属": "电池",
+            "ai算力": "算力",
+            "算力租赁": "算力",
+            "东数西算": "算力",
+            "数据中心": "算力",
+            "液冷服务器": "算力",
+            "服务器": "算力",
+            "云计算": "算力",
+            "光模块": "算力",
+            "cpo": "算力",
+            "人工智能": "算力",
+        }
+        for source, target in hot_theme_aliases.items():
+            if source in text:
+                text = target
+                break
         for suffix in ("概念", "板块", "行业", "制造业", "加工业", "采选业", "业"):
             if text.endswith(suffix) and len(text) > len(suffix) + 1:
                 text = text[: -len(suffix)]
@@ -2804,8 +2876,14 @@ class StockPickerService:
         if len(normalized) >= 4:
             variants.add(normalized[:4])
         if len(normalized) >= 2:
+            focused_terms = {
+                "电池", "锂电", "算力", "光伏", "储能", "芯片", "半导体", "游戏",
+                "传媒", "机器人", "低空", "军工", "有色", "稀土",
+            }
             for idx in range(len(normalized) - 1):
-                variants.add(normalized[idx: idx + 2])
+                item = normalized[idx: idx + 2]
+                if item in focused_terms:
+                    variants.add(item)
         return [item for item in variants if item]
 
     @classmethod
@@ -2933,6 +3011,8 @@ class StockPickerService:
             "capital_bottom": capital_bottom_items,
             "capital_top_map": capital_top_map,
             "capital_bottom_map": capital_bottom_map,
+            "real_top_map": dict(top_map),
+            "real_capital_top_map": dict(capital_top_map),
             "updated_at": datetime.now().isoformat(),
         }
         self._sector_snapshot_cache[cache_key] = snapshot
@@ -2997,12 +3077,34 @@ class StockPickerService:
 
     @staticmethod
     def _select_theme_board_names(board_names: Sequence[str], *, max_items: int = 3) -> List[str]:
-        selected: List[str] = []
+        hot_keywords = (
+            "锂", "电池", "能源金属", "固态电池", "钠离子", "算力", "数据中心", "服务器",
+            "云计算", "人工智能", "ai", "cpo", "光模块", "机器人", "半导体", "芯片",
+            "光伏", "储能", "低空", "军工",
+        )
+        weak_keywords = (
+            "板块", "深成", "沪股", "中证", "qfii", "养老金", "融资", "转债", "微盘",
+            "小盘", "中盘", "大盘", "破增发", "预增", "msci",
+        )
+        prioritized: List[str] = []
+        regular: List[str] = []
         for raw_name in board_names:
             name = str(raw_name or "").strip()
-            if not name or name in selected:
+            if not name:
                 continue
-            selected.append(name)
+            lower_name = name.lower()
+            if any(keyword in lower_name for keyword in hot_keywords):
+                if name not in prioritized:
+                    prioritized.append(name)
+                continue
+            if any(keyword in lower_name for keyword in weak_keywords):
+                continue
+            if name not in regular:
+                regular.append(name)
+        selected: List[str] = []
+        for name in prioritized + regular:
+            if name not in selected:
+                selected.append(name)
             if len(selected) >= max_items:
                 break
         return selected
@@ -3199,6 +3301,8 @@ class StockPickerService:
 
         top_map = dict(snapshot.get("top_map") or {})
         capital_top_map = dict(snapshot.get("capital_top_map") or {})
+        snapshot.setdefault("real_top_map", dict(top_map))
+        snapshot.setdefault("real_capital_top_map", dict(capital_top_map))
         for key, value in (snapshot["derived_top_map"] or {}).items():
             top_map.setdefault(key, value)
         for key, value in (snapshot["derived_capital_top_map"] or {}).items():
@@ -3209,6 +3313,28 @@ class StockPickerService:
         if not snapshot.get("capital_top"):
             snapshot["capital_top"] = list(snapshot["derived_capital_top"])
         return snapshot
+
+    def _build_focus_theme_hit(self, board_names: Sequence[str], *, pct_chg: float) -> Optional[Dict[str, Any]]:
+        for raw_name in board_names:
+            name = str(raw_name or "").strip()
+            normalized = self._normalize_board_name(name)
+            if normalized == "电池":
+                return {
+                    "name": name,
+                    "change_pct": round(float(pct_chg or 0.0), 2),
+                    "rank": 3,
+                    "source": "focus_theme",
+                    "theme_family": "锂电",
+                }
+            if normalized == "算力" and float(pct_chg or 0.0) >= 4.0:
+                return {
+                    "name": name,
+                    "change_pct": round(float(pct_chg or 0.0), 2),
+                    "rank": 4,
+                    "source": "focus_theme",
+                    "theme_family": "算力",
+                }
+        return None
 
     def _apply_theme_strength(
         self,
@@ -3221,9 +3347,13 @@ class StockPickerService:
         if not candidates or not sector_snapshot:
             return
 
-        top_map = sector_snapshot.get("top_map") or {}
+        if strategy_id == "shanliu_theme_flow":
+            top_map = sector_snapshot.get("real_top_map") or {}
+            capital_top_map = sector_snapshot.get("real_capital_top_map") or {}
+        else:
+            top_map = sector_snapshot.get("real_top_map") or sector_snapshot.get("top_map") or {}
+            capital_top_map = sector_snapshot.get("real_capital_top_map") or sector_snapshot.get("capital_top_map") or {}
         bottom_map = sector_snapshot.get("bottom_map") or {}
-        capital_top_map = sector_snapshot.get("capital_top_map") or {}
         capital_bottom_map = sector_snapshot.get("capital_bottom_map") or {}
         derived_top_map = sector_snapshot.get("derived_top_map") or {}
         derived_capital_top_map = sector_snapshot.get("derived_capital_top_map") or {}
@@ -3251,6 +3381,9 @@ class StockPickerService:
             capital_bottom_hit = self._match_sector_record(board_names, capital_bottom_map)
             peer_top_hit = self._match_sector_record(primary_boards or board_names, derived_top_map)
             peer_capital_hit = self._match_sector_record(primary_boards or board_names, derived_capital_top_map)
+            focus_theme_hit = self._build_focus_theme_hit(primary_boards or board_names, pct_chg=self._to_float(candidate.get("metrics", {}).get("pct_chg")))
+            if strategy_id == "shanliu_theme_flow" and top_hit is None and focus_theme_hit is not None:
+                top_hit = focus_theme_hit
             metrics = candidate.setdefault("metrics", {})
             pct_chg = self._to_float(metrics.get("pct_chg"))
             amount_ratio = self._to_float(metrics.get("amount_ratio"))
@@ -3269,6 +3402,9 @@ class StockPickerService:
                     theme_delta += 7
                 else:
                     theme_delta += 4
+                if strategy_id == "shanliu_theme_flow" and str(top_hit.get("source") or "") == "focus_theme":
+                    theme_delta += 14
+                    theme_reasons.append(f"命中{top_hit.get('theme_family') or top_hit.get('name')}焦点题材，山流优先按主线跟随处理")
                 rel_strength = pct_chg - self._to_float(top_hit.get("change_pct"))
                 if rel_strength >= 2.0:
                     theme_delta += 6
@@ -3293,13 +3429,17 @@ class StockPickerService:
                 peer_rank = int(peer_top_hit.get("rank") or 99)
                 peer_count = int(peer_top_hit.get("candidate_count") or 0)
                 peer_avg_pct = self._to_float(peer_top_hit.get("change_pct"))
-                if peer_rank <= 5 and (peer_count >= 2 or peer_avg_pct >= 1.2):
-                    if peer_rank <= 3:
-                        theme_delta += 8
+                peer_count_ok = peer_count >= 2 or (strategy_id != "shanliu_theme_flow" and peer_avg_pct >= 1.2)
+                if peer_rank <= 5 and peer_count_ok:
+                    if strategy_id == "shanliu_theme_flow":
+                        theme_delta += 3 if peer_count >= 3 else 1
                     else:
-                        theme_delta += 5
-                    if peer_count >= 2:
-                        theme_delta += 3
+                        if peer_rank <= 3:
+                            theme_delta += 8
+                        else:
+                            theme_delta += 5
+                        if peer_count >= 2:
+                            theme_delta += 3
                     theme_reasons.append(
                         f"同题材候选共振较强，{peer_top_hit['name']} 在候选池热度排名靠前"
                     )
@@ -3330,14 +3470,19 @@ class StockPickerService:
                 peer_cap_strength = self._to_float(peer_capital_hit.get("net_inflow"))
                 if peer_cap_rank <= 5 and peer_cap_strength > 1.0 and (
                     peer_cap_count >= 2
-                    or peer_cap_strength >= 6.0
-                    or self._to_float(peer_capital_hit.get("institution_ratio")) >= 0.5
+                    or (
+                        strategy_id != "shanliu_theme_flow"
+                        and (
+                            peer_cap_strength >= 6.0
+                            or self._to_float(peer_capital_hit.get("institution_ratio")) >= 0.5
+                        )
+                    )
                 ):
                     if peer_cap_rank <= 3:
-                        theme_delta += 10
+                        theme_delta += 3 if strategy_id == "shanliu_theme_flow" else 10
                     else:
-                        theme_delta += 7
-                    if peer_cap_count >= 2:
+                        theme_delta += 2 if strategy_id == "shanliu_theme_flow" else 7
+                    if peer_cap_count >= 2 and strategy_id != "shanliu_theme_flow":
                         theme_delta += 2
                     capital_top_hit = peer_capital_hit
                     theme_reasons.append(
@@ -3399,8 +3544,8 @@ class StockPickerService:
                     continue
 
             if strategy_id == "shanliu_theme_flow":
-                has_hot_theme = top_hit is not None or peer_top_hit is not None
-                has_capital_theme = capital_top_hit is not None or peer_capital_hit is not None
+                has_hot_theme = top_hit is not None
+                has_capital_theme = capital_top_hit is not None
                 if has_hot_theme and has_capital_theme:
                     theme_delta += 16
                     theme_reasons.append("山流要求的题材强度与资金流入同时命中，作为主导加分项")
@@ -3430,6 +3575,11 @@ class StockPickerService:
             metrics["theme_strength_label"] = "hot" if theme_delta > 0 else ("cold" if theme_delta < 0 else "neutral")
             metrics["hot_money_market"] = hot_money_market
             metrics["risk_off_market"] = risk_off_market
+            metrics["hard_exclude"] = bool(
+                strategy_id == "shanliu_theme_flow"
+                and top_hit is None
+                and capital_top_hit is None
+            )
             reasons = candidate.setdefault("reasons", [])
             for reason in theme_reasons[:2]:
                 if reason not in reasons:
