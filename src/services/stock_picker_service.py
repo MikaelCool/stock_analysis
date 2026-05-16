@@ -91,6 +91,12 @@ _PICKER_STRATEGY_PRESETS: Dict[str, Dict[str, Any]] = {
             "trend_follow_max_ma20_distance_pct": 6.8,
             "trend_follow_max_ma5_distance_pct": 3.8,
             "trend_follow_market_score_floor": 46.0,
+            "trend_follow_min_recent10_return_pct": 3.0,
+            "trend_follow_min_recent20_return_pct": 6.0,
+            "trend_follow_min_atr_pct": 2.0,
+            "trend_follow_min_ma_gap_mean_pct": 0.8,
+            "trend_follow_min_institution_days": 2,
+            "trend_follow_min_short_fund_days": 1,
             "ma_gap_balance_limit_pct": 2.6,
             "ma_gap_min_pct": 0.08,
             "preferred_setup_type": "trend_follow",
@@ -1429,6 +1435,12 @@ class StockPickerService:
                         "amount_ratio": float(metrics.get("amount_ratio") or 0.0),
                         "market_score": float(metrics.get("market_score") or market_score),
                         "theme_score_delta": float(metrics.get("theme_score_delta") or 0.0),
+                        "recent_institution_drive_days": int(metrics.get("recent_institution_drive_days") or 0),
+                        "recent_short_fund_days": int(metrics.get("recent_short_fund_days") or 0),
+                        "recent10_return_pct": float(metrics.get("recent10_return_pct") or 0.0),
+                        "recent20_return_pct": float(metrics.get("recent20_return_pct") or 0.0),
+                        "atr_pct": float(metrics.get("atr_pct") or 0.0),
+                        "ma_gap_mean_pct": float(metrics.get("ma_gap_mean_pct") or 0.0),
                         "prior_limit_streak": bool(metrics.get("prior_limit_streak")),
                         "prior_limit_count": int(metrics.get("prior_limit_count") or 0),
                         "cross_with_volume": bool(metrics.get("cross_with_volume")),
@@ -1673,6 +1685,62 @@ class StockPickerService:
                         "setup_type_distribution": setup_breakdown,
                     },
                 }
+
+            if strategy_id in {"main_force_breakout", "shanliu_theme_flow"}:
+                best_score = -10**9
+                best_payload = None
+
+            if strategy_id == "swing_trend_follow":
+                for horizon in horizons_to_try:
+                    horizon_rows = [row for row in candidate_rows if row["horizon_days"] == horizon]
+                    if len(horizon_rows) < 6:
+                        continue
+                    for min_score_threshold in (70.0, 73.0, 76.0, 78.0):
+                        for max_ma20_distance_pct in (5.5, 6.0, 6.8):
+                            for min_recent20_return_pct in (6.0, 8.0, 10.0):
+                                for min_atr_pct in (1.8, 2.0, 2.2):
+                                    for market_score_floor in (42.0, 46.0, 50.0):
+                                        filtered = [
+                                            row
+                                            for row in horizon_rows
+                                            if row["setup_type"] == "trend_follow"
+                                            and row["score"] >= min_score_threshold
+                                            and row["distance_to_ma20_pct"] <= max_ma20_distance_pct
+                                            and row["recent_institution_drive_days"] >= 1
+                                            and row["recent_short_fund_days"] >= 1
+                                            and row["recent10_return_pct"] >= 3.0
+                                            and row["recent20_return_pct"] >= min_recent20_return_pct
+                                            and row["atr_pct"] >= min_atr_pct
+                                            and row["ma_gap_mean_pct"] >= 0.8
+                                        ]
+                                        if len(filtered) < 6:
+                                            continue
+                                        params = dict(strategy["params"])
+                                        params.update(
+                                            {
+                                                "min_score_threshold": min_score_threshold,
+                                                "trend_follow_min_score_threshold": min_score_threshold,
+                                                "trend_follow_max_ma20_distance_pct": max_ma20_distance_pct,
+                                                "trend_follow_min_recent10_return_pct": 3.0,
+                                                "trend_follow_min_recent20_return_pct": min_recent20_return_pct,
+                                                "trend_follow_min_atr_pct": min_atr_pct,
+                                                "trend_follow_min_ma_gap_mean_pct": 0.8,
+                                                "trend_follow_min_institution_days": 1,
+                                                "trend_follow_min_short_fund_days": 1,
+                                                "trend_follow_market_score_floor": market_score_floor,
+                                                "preferred_setup_type": "trend_follow",
+                                            }
+                                        )
+                                        payload = build_specialized_payload(
+                                            filtered=filtered,
+                                            horizon=horizon,
+                                            params=params,
+                                            market_score_floor=market_score_floor,
+                                        )
+                                        objective = self._to_float((payload.get("metrics") or {}).get("objective"), -10**9)
+                                        if objective > best_score:
+                                            best_score = objective
+                                            best_payload = payload
 
             if strategy_id == "main_force_breakout":
                 for horizon in horizons_to_try:
@@ -2294,10 +2362,46 @@ class StockPickerService:
         amount = self._to_float(today.get("amount"))
         amount_ma20 = max(self._to_float(recent20["amount"].mean()), 1.0) if "amount" in recent20.columns else 1.0
         amount_ratio = amount / max(amount_ma20, 0.01) if amount > 0 else 0.0
+        amount_ma20_series = bars["amount"].rolling(20).mean().replace(0, pd.NA)
+        amount_ratio_series = bars["amount"] / amount_ma20_series
+        volume_ratio_series = bars["volume"] / bars["vol_ma20"].replace(0, pd.NA)
+        close_near_high_series = ((bars["high"] - bars["close"]) / bars["close"].replace(0, pd.NA) * 100) <= 0.8
+        body_pct_series = ((bars["close"] - bars["open"]).abs() / bars["close"].replace(0, pd.NA) * 100)
+        upper_shadow_series = (
+            (bars["high"] - bars[["close", "open"]].max(axis=1)).clip(lower=0)
+            / bars["close"].replace(0, pd.NA)
+            * 100
+        )
+        recent_institution_drive_days = int(
+            (
+                amount_ratio_series.tail(10).ge(1.1)
+                & close_near_high_series.tail(10)
+                & upper_shadow_series.tail(10).le(1.0)
+                & body_pct_series.tail(10).ge(1.2)
+            ).sum()
+        )
+        recent_short_fund_days = int(
+            (
+                amount_ratio_series.tail(8).ge(1.15)
+                & volume_ratio_series.tail(8).ge(1.25)
+                & bars["pct_chg"].tail(8).ge(1.2)
+                & close_near_high_series.tail(8)
+            ).sum()
+        )
         high_20_prev = self._to_float(recent20["high"].shift(1).max())
         low_20_prev = self._to_float(recent20["low"].shift(1).min())
         high_60 = self._to_float(recent60["high"].max())
         low_60 = self._to_float(recent60["low"].min())
+        recent10_return_pct = (
+            (close_price / max(self._to_float(bars.iloc[-11]["close"]), 0.01) - 1.0) * 100
+            if len(bars) >= 11
+            else 0.0
+        )
+        recent20_return_pct = (
+            (close_price / max(self._to_float(bars.iloc[-21]["close"]), 0.01) - 1.0) * 100
+            if len(bars) >= 21
+            else 0.0
+        )
         recent_decline_pct = (high_60 - close_price) / max(high_60, 0.01) * 100 if high_60 > 0 else 0.0
         breakout_above_20 = bool(close_price >= max(high_20_prev * 1.002, ma20))
         support_hold = bool(low_price >= low_20_prev * 0.985 if low_20_prev > 0 else True)
@@ -2393,6 +2497,30 @@ class StockPickerService:
         )
         ma_gap_mean_pct = sum(positive_ma_gaps) / len(positive_ma_gaps) if len(positive_ma_gaps) == 3 else 0.0
         ma_gap_uniformity_score = max(0.0, 100.0 - ma_gap_balance_pct * 25.0) if ma_gap_balance_pct < 999 else 0.0
+        trend_follow_min_recent10_return_pct = float(params.get("trend_follow_min_recent10_return_pct", 3.0) or 3.0)
+        trend_follow_min_recent20_return_pct = float(params.get("trend_follow_min_recent20_return_pct", 6.0) or 6.0)
+        trend_follow_min_atr_pct = float(params.get("trend_follow_min_atr_pct", 2.0) or 2.0)
+        trend_follow_min_ma_gap_mean_pct = float(params.get("trend_follow_min_ma_gap_mean_pct", 0.8) or 0.8)
+        trend_follow_min_institution_days = int(float(params.get("trend_follow_min_institution_days", 2) or 2))
+        trend_follow_min_short_fund_days = int(float(params.get("trend_follow_min_short_fund_days", 1) or 1))
+        institution_drive_confirmed = bool(
+            institution_style or recent_institution_drive_days >= trend_follow_min_institution_days
+        )
+        short_fund_confirmed = bool(
+            recent_short_fund_days >= trend_follow_min_short_fund_days
+            or (
+                volume_spike_factor >= 1.35
+                and amount_ratio >= 1.2
+                and pct_chg >= 1.2
+                and close_near_high
+            )
+        )
+        healthy_main_rise = bool(
+            recent10_return_pct >= trend_follow_min_recent10_return_pct
+            and recent20_return_pct >= trend_follow_min_recent20_return_pct
+            and atr_pct >= trend_follow_min_atr_pct
+            and ma_gap_mean_pct >= trend_follow_min_ma_gap_mean_pct
+        )
 
         limitup_lookback = int(float(params.get("main_force_limitup_lookback_days", 60) or 60))
         recent_limit_window = bars.tail(max(8, limitup_lookback)).copy()
@@ -2482,6 +2610,9 @@ class StockPickerService:
                 and distance_to_ma5_pct <= trend_follow_max_ma5_distance_pct
                 and distance_to_ma20_pct <= trend_follow_max_ma20_distance_pct
                 and volume_spike_factor >= trend_follow_volume_spike_multiplier
+                and institution_drive_confirmed
+                and short_fund_confirmed
+                and healthy_main_rise
                 and macd_bull
                 and not weak_money_follow
             )
@@ -2491,6 +2622,15 @@ class StockPickerService:
             if strategy_id == "swing_trend_follow" and not swing_pullback_quality:
                 score -= 35
                 reasons.append("不是合格小级别回调：K线实体需守在 MA20 上方或贴近 MA20，不能明显跌破")
+            if strategy_id == "swing_trend_follow" and not institution_drive_confirmed:
+                score -= 24
+                reasons.append("缺少机构主导确认：近阶段没有足够的机构推动日")
+            if strategy_id == "swing_trend_follow" and not short_fund_confirmed:
+                score -= 18
+                reasons.append("缺少短线资金配合：近阶段没有形成有效量价跟随")
+            if strategy_id == "swing_trend_follow" and not healthy_main_rise:
+                score -= 22
+                reasons.append("主升质量不足：近端涨幅、波动活跃度或均线扩散力度不够")
             if trend_follow_mode and (not passed or strategy_id == "swing_trend_follow"):
                 setup_type = "trend_follow"
                 score += 42
@@ -2846,6 +2986,10 @@ class StockPickerService:
                     "market_score": round(market_score, 2),
                     "pct_chg": round(pct_chg, 2),
                     "amount_ratio": round(amount_ratio, 2),
+                    "recent_institution_drive_days": recent_institution_drive_days,
+                    "recent_short_fund_days": recent_short_fund_days,
+                    "recent10_return_pct": round(recent10_return_pct, 2),
+                    "recent20_return_pct": round(recent20_return_pct, 2),
                     "atr14": round(atr14, 2),
                     "atr_pct": round(atr_pct, 2),
                     "range_40_pct": round(range_40_pct, 2),
@@ -2860,7 +3004,16 @@ class StockPickerService:
                     "wick_near_ma20": wick_near_ma20,
                     "body_low_vs_ma20_pct": round(body_low_vs_ma20_pct, 2),
                     "low_vs_ma20_pct": round(low_vs_ma20_pct, 2),
-                    "hard_exclude": bool(strategy_id == "swing_trend_follow" and not (major_uptrend and swing_pullback_quality)),
+                    "hard_exclude": bool(
+                        strategy_id == "swing_trend_follow"
+                        and not (
+                            major_uptrend
+                            and swing_pullback_quality
+                            and institution_drive_confirmed
+                            and short_fund_confirmed
+                            and healthy_main_rise
+                        )
+                    ),
                     "ma20_up": ma20_up,
                     "ma60_up": ma60_up,
                     "top_divergence": top_divergence,
@@ -2869,8 +3022,12 @@ class StockPickerService:
                     "ma_gap_10_20_pct": round(ma_gap_10_20_pct, 2),
                     "ma_gap_20_30_pct": round(ma_gap_20_30_pct, 2),
                     "ma_gap_balance_pct": round(ma_gap_balance_pct, 2) if ma_gap_balance_pct < 999 else None,
+                    "ma_gap_mean_pct": round(ma_gap_mean_pct, 2),
                     "ma_gap_uniformity_score": round(ma_gap_uniformity_score, 2),
                     "orderly_ma_spacing": orderly_ma_spacing,
+                    "institution_drive_confirmed": institution_drive_confirmed,
+                    "short_fund_confirmed": short_fund_confirmed,
+                    "healthy_main_rise": healthy_main_rise,
                     "prior_limit_streak": prior_limit_streak,
                     "prior_limit_count": prior_limit_count,
                     "cross_with_volume": cross_with_volume,
@@ -2899,6 +3056,10 @@ class StockPickerService:
                 "market_score": round(market_score, 2),
                 "pct_chg": round(pct_chg, 2),
                 "amount_ratio": round(amount_ratio, 2),
+                "recent_institution_drive_days": recent_institution_drive_days,
+                "recent_short_fund_days": recent_short_fund_days,
+                "recent10_return_pct": round(recent10_return_pct, 2),
+                "recent20_return_pct": round(recent20_return_pct, 2),
                 "atr14": round(atr14, 2),
                 "atr_pct": round(atr_pct, 2),
                 "range_40_pct": round(range_40_pct, 2),
@@ -2924,8 +3085,12 @@ class StockPickerService:
                 "ma_gap_10_20_pct": round(ma_gap_10_20_pct, 2),
                 "ma_gap_20_30_pct": round(ma_gap_20_30_pct, 2),
                 "ma_gap_balance_pct": round(ma_gap_balance_pct, 2) if ma_gap_balance_pct < 999 else None,
+                "ma_gap_mean_pct": round(ma_gap_mean_pct, 2),
                 "ma_gap_uniformity_score": round(ma_gap_uniformity_score, 2),
                 "orderly_ma_spacing": orderly_ma_spacing,
+                "institution_drive_confirmed": institution_drive_confirmed,
+                "short_fund_confirmed": short_fund_confirmed,
+                "healthy_main_rise": healthy_main_rise,
                 "prior_limit_streak": prior_limit_streak,
                 "prior_limit_count": prior_limit_count,
                 "cross_with_volume": cross_with_volume,
@@ -3759,9 +3924,12 @@ class StockPickerService:
             metrics["hot_money_market"] = hot_money_market
             metrics["risk_off_market"] = risk_off_market
             metrics["hard_exclude"] = bool(
-                strategy_id == "shanliu_theme_flow"
-                and top_hit is None
-                and capital_top_hit is None
+                metrics.get("hard_exclude")
+                or (
+                    strategy_id == "shanliu_theme_flow"
+                    and top_hit is None
+                    and capital_top_hit is None
+                )
             )
             reasons = candidate.setdefault("reasons", [])
             for reason in theme_reasons[:2]:
@@ -3951,7 +4119,7 @@ def _picker_build_strategy_catalog() -> List[Dict[str, Any]]:
         {
             "strategy_id": "swing_trend_follow",
             "name": "波段趋势",
-            "description": "只在沪深主板非 ST 股票池内选股，重点识别 5/10/20/30 日线多头向上、均线间隔有序、趋势稳定的波段跟随标的。",
+            "description": "只在沪深主板非 ST 股票池内选股，重点识别机构主导、短线资金配合、处于健康主升段的波段跟随标的。",
             "skill_id": "swing_trend_follow",
             "category": "swing",
         },
