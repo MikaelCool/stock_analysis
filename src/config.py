@@ -953,7 +953,7 @@ class Config:
             elif anthropic_api_keys:
                 litellm_model = f'anthropic/{_anthropic_model_name}'
             elif deepseek_api_keys:
-                litellm_model = 'deepseek/deepseek-chat'
+                litellm_model = 'deepseek/deepseek-v4-pro'
             elif openai_api_keys:
                 # For openai-compatible models, add prefix only if not already prefixed
                 if '/' not in _openai_model_name:
@@ -1298,13 +1298,13 @@ class Config:
             ),
             sqlite_write_retry_max=parse_env_int(
                 os.getenv('SQLITE_WRITE_RETRY_MAX'),
-                3,
+                8,
                 field_name='SQLITE_WRITE_RETRY_MAX',
                 minimum=0,
             ),
             sqlite_write_retry_base_delay=parse_env_float(
                 os.getenv('SQLITE_WRITE_RETRY_BASE_DELAY'),
-                0.1,
+                0.25,
                 field_name='SQLITE_WRITE_RETRY_BASE_DELAY',
                 minimum=0.0,
             ),

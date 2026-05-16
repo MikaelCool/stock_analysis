@@ -976,7 +976,7 @@ class StockPickerService:
                             continue
                         enriched_updates[int(update["id"])] = update
 
-            with service.db.session_scope() as session:
+            def write_operation(session):
                 rows = session.execute(
                     select(StockSelectionCandidate)
                     .where(StockSelectionCandidate.run_id == run_id)
@@ -995,6 +995,8 @@ class StockPickerService:
                     row.news_context_json = update.get("news_context_json")
                     row.action_plan_markdown = str(update.get("action_plan_markdown") or "").strip()
                     row.llm_model = update.get("llm_model")
+
+            service._write_with_retry("update_stock_picker_enrichment", write_operation)
 
             service._update_run_status(run_id=run_id, status="completed", completed=True)
             payload = service.get_run_detail(run_id)
@@ -1047,7 +1049,7 @@ class StockPickerService:
         return any(marker in text for marker in malformed_markers)
 
     def _repair_stuck_run(self, *, run_id: int) -> None:
-        with self.db.session_scope() as session:
+        def write_operation(session):
             run = session.execute(
                 select(StockSelectionRun).where(StockSelectionRun.id == run_id)
             ).scalar_one_or_none()
@@ -1067,13 +1069,20 @@ class StockPickerService:
                 run.summary_markdown = "扫描进程已中断：后台服务重启或旧任务超时，请重新发起选股。"
             elif not candidate_rows and run.created_at <= datetime.now() - timedelta(minutes=10):
                 summary = str(run.summary_markdown or "")
-                if "今日没有符合条件的标的" in summary or "候选股" in summary:
+                # A newly-created async run already contains a placeholder
+                # "no candidate" summary. Treat it as a valid empty result
+                # only after the full-market scan wrote a real scanned count.
+                if int(run.total_scanned or 0) >= 1000 and (
+                    "今日没有符合条件的标的" in summary or "候选股" in summary
+                ):
                     run.status = "completed"
                     run.completed_at = datetime.now()
                     return
                 run.status = "failed"
                 run.completed_at = datetime.now()
-                run.summary_markdown = "扫描进程已中断：任务超过 10 分钟仍未写入候选，请重新发起选股。"
+                run.summary_markdown = "扫描进程已中断：任务未完成全市场扫描或写库，请重新发起选股。"
+
+        self._write_with_retry("repair_stock_picker_run", write_operation)
 
     def _repair_stale_runs(self, *, older_than_minutes: int = 10) -> None:
         cutoff = datetime.now() - timedelta(minutes=max(1, older_than_minutes))
@@ -1128,7 +1137,7 @@ class StockPickerService:
         return int(row) if row is not None else None
 
     def _update_run_status(self, *, run_id: int, status: str, completed: bool) -> None:
-        with self.db.session_scope() as session:
+        def write_operation(session):
             run = session.execute(
                 select(StockSelectionRun).where(StockSelectionRun.id == run_id)
             ).scalar_one_or_none()
@@ -1140,10 +1149,13 @@ class StockPickerService:
             else:
                 run.completed_at = None
 
+        self._write_with_retry("update_stock_picker_run_status", write_operation)
+
     def _mark_run_failed(self, *, run_id: int, reason: str) -> None:
         message = (reason or "未知错误").strip()
         summary = f"扫描失败：{message}"
-        with self.db.session_scope() as session:
+
+        def write_operation(session):
             run = session.execute(
                 select(StockSelectionRun).where(StockSelectionRun.id == run_id)
             ).scalar_one_or_none()
@@ -1152,6 +1164,8 @@ class StockPickerService:
             run.status = "failed"
             run.completed_at = datetime.now()
             run.summary_markdown = summary[:4000]
+
+        self._write_with_retry("mark_stock_picker_run_failed", write_operation)
 
     def _replace_scan_run_payload(
         self,
@@ -1164,7 +1178,7 @@ class StockPickerService:
         us_snapshot: Dict[str, Any],
         optimization: Optional[Dict[str, Any]],
     ) -> None:
-        with self.db.session_scope() as session:
+        def write_operation(session):
             run = session.execute(
                 select(StockSelectionRun).where(StockSelectionRun.id == run_id)
             ).scalar_one_or_none()
@@ -1224,6 +1238,15 @@ class StockPickerService:
                         created_at=datetime.now(),
                     )
                 )
+
+        self._write_with_retry("replace_stock_picker_run_payload", write_operation)
+
+    def _write_with_retry(self, operation_name: str, write_operation):
+        runner = getattr(self.db, "_run_write_transaction", None)
+        if callable(runner):
+            return runner(operation_name, write_operation)
+        with self.db.session_scope() as session:
+            return write_operation(session)
 
     @staticmethod
     def _enrichment_lock_path(run_id: int) -> Path:
@@ -1403,7 +1426,14 @@ class StockPickerService:
                         "distance_to_ma20_pct": float(metrics.get("distance_to_ma20_pct") or 999.0),
                         "distance_to_ma5_pct": float(metrics.get("distance_to_ma5_pct") or 999.0),
                         "volume_spike_factor": float(metrics.get("volume_spike_factor") or 0.0),
+                        "amount_ratio": float(metrics.get("amount_ratio") or 0.0),
                         "market_score": float(metrics.get("market_score") or market_score),
+                        "theme_score_delta": float(metrics.get("theme_score_delta") or 0.0),
+                        "prior_limit_streak": bool(metrics.get("prior_limit_streak")),
+                        "prior_limit_count": int(metrics.get("prior_limit_count") or 0),
+                        "cross_with_volume": bool(metrics.get("cross_with_volume")),
+                        "pullback_to_ma20": bool(metrics.get("pullback_to_ma20")),
+                        "post_cross_shrink": bool(metrics.get("post_cross_shrink")),
                         "setup_type": str(candidate.setup_type or "mixed"),
                         "horizon_days": int(backtest.horizon_days or 0),
                         "max_drawdown_pct": float(backtest.max_drawdown_pct or 0.0),
@@ -1577,6 +1607,159 @@ class StockPickerService:
                                                         }
                                                     )
                                                 best_payload["params"] = dual_params
+
+            def build_specialized_payload(
+                *,
+                filtered: Sequence[Dict[str, Any]],
+                horizon: int,
+                params: Dict[str, Any],
+                market_score_floor: float,
+            ) -> Dict[str, Any]:
+                avg_return = sum(row["return_pct"] for row in filtered) / len(filtered)
+                median_return = sorted(row["return_pct"] for row in filtered)[len(filtered) // 2]
+                win_rate = sum(1 for row in filtered if row["return_pct"] > 0) / len(filtered)
+                loss_rate = sum(1 for row in filtered if row["return_pct"] < 0) / len(filtered)
+                avg_drawdown = sum(row["max_drawdown_pct"] for row in filtered) / len(filtered)
+                worst_drawdown = min(row["max_drawdown_pct"] for row in filtered)
+                high_drawdown_rate = sum(1 for row in filtered if row["max_drawdown_pct"] <= -5.0) / len(filtered)
+                tail_loss_rate = sum(1 for row in filtered if row["return_pct"] <= -3.0) / len(filtered)
+                market_penalties = [
+                    max(0.0, (market_score_floor - float(row["market_score"] or 0.0)) * 1.1 + 4.0)
+                    if float(row["market_score"] or 0.0) < market_score_floor
+                    else 0.0
+                    for row in filtered
+                ]
+                avg_market_penalty = sum(market_penalties) / len(market_penalties)
+                positive_returns = sum(max(row["return_pct"], 0.0) for row in filtered)
+                negative_returns = abs(sum(min(row["return_pct"], 0.0) for row in filtered))
+                profit_factor = positive_returns / max(negative_returns, 0.01)
+                objective = (
+                    avg_return * 1.15
+                    + median_return * 0.55
+                    + win_rate * 8.5
+                    + min(profit_factor, 4.0) * 1.6
+                    - abs(avg_drawdown) * 1.45
+                    - abs(worst_drawdown) * 0.42
+                    - high_drawdown_rate * 9.0
+                    - tail_loss_rate * 8.0
+                    - loss_rate * 2.5
+                    - avg_market_penalty * 0.35
+                    + min(len(filtered), 30) * 0.04
+                )
+                setup_breakdown: Dict[str, int] = {}
+                for row in filtered:
+                    row_setup = str(row["setup_type"] or "mixed")
+                    setup_breakdown[row_setup] = setup_breakdown.get(row_setup, 0) + 1
+                return {
+                    "strategy_id": strategy_id,
+                    "strategy_name": strategy["name"],
+                    "lookback_days": lookback_days,
+                    "selected_horizon_days": horizon,
+                    "status": "completed",
+                    "params": params,
+                    "metrics": {
+                        "sample_count": len(filtered),
+                        "avg_return_pct": round(avg_return, 2),
+                        "median_return_pct": round(median_return, 2),
+                        "win_rate_pct": round(win_rate * 100, 2),
+                        "loss_rate_pct": round(loss_rate * 100, 2),
+                        "avg_max_drawdown_pct": round(avg_drawdown, 2),
+                        "worst_drawdown_pct": round(worst_drawdown, 2),
+                        "high_drawdown_rate_pct": round(high_drawdown_rate * 100, 2),
+                        "tail_loss_rate_pct": round(tail_loss_rate * 100, 2),
+                        "profit_factor": round(profit_factor, 3),
+                        "avg_market_penalty": round(avg_market_penalty, 2),
+                        "objective": round(objective, 4),
+                        "setup_type_distribution": setup_breakdown,
+                    },
+                }
+
+            if strategy_id == "main_force_breakout":
+                for horizon in horizons_to_try:
+                    horizon_rows = [row for row in candidate_rows if row["horizon_days"] == horizon]
+                    if len(horizon_rows) < 6:
+                        continue
+                    for min_score_threshold in (68.0, 72.0, 74.0, 78.0):
+                        for max_ma20_distance_pct in (2.0, 2.5, 3.0, 3.5):
+                            for market_score_floor in (42.0, 46.0, 48.0, 52.0):
+                                filtered = [
+                                    row
+                                    for row in horizon_rows
+                                    if row["setup_type"] == "main_force_breakout"
+                                    and row["score"] >= min_score_threshold
+                                    and row["prior_limit_streak"]
+                                    and row["prior_limit_count"] >= 2
+                                    and row["cross_with_volume"]
+                                    and row["pullback_to_ma20"]
+                                    and row["post_cross_shrink"]
+                                    and row["distance_to_ma20_pct"] <= max_ma20_distance_pct
+                                ]
+                                if len(filtered) < 6:
+                                    continue
+                                params = dict(strategy["params"])
+                                params.update(
+                                    {
+                                        "min_score_threshold": min_score_threshold,
+                                        "main_force_min_score_threshold": min_score_threshold,
+                                        "main_force_pullback_max_ma20_distance_pct": max_ma20_distance_pct,
+                                        "main_force_market_score_floor": market_score_floor,
+                                        "preferred_setup_type": "main_force_breakout",
+                                    }
+                                )
+                                payload = build_specialized_payload(
+                                    filtered=filtered,
+                                    horizon=horizon,
+                                    params=params,
+                                    market_score_floor=market_score_floor,
+                                )
+                                objective = self._to_float((payload.get("metrics") or {}).get("objective"), -10**9)
+                                if objective > best_score:
+                                    best_score = objective
+                                    best_payload = payload
+
+            if strategy_id == "shanliu_theme_flow":
+                for horizon in horizons_to_try:
+                    horizon_rows = [row for row in candidate_rows if row["horizon_days"] == horizon]
+                    if len(horizon_rows) < 6:
+                        continue
+                    for min_score_threshold in (58.0, 64.0, 70.0, 76.0):
+                        for volume_spike_multiplier in (1.15, 1.25, 1.4, 1.6):
+                            for amount_ratio_min in (1.0, 1.05, 1.15, 1.25):
+                                for theme_required_score_delta in (4.0, 8.0, 12.0, 16.0):
+                                    for market_score_floor in (40.0, 44.0, 48.0, 52.0):
+                                        filtered = [
+                                            row
+                                            for row in horizon_rows
+                                            if row["setup_type"].startswith("shanliu_")
+                                            and row["score"] >= min_score_threshold
+                                            and row["volume_spike_factor"] >= volume_spike_multiplier
+                                            and row["amount_ratio"] >= amount_ratio_min
+                                            and row["theme_score_delta"] >= theme_required_score_delta
+                                        ]
+                                        if len(filtered) < 6:
+                                            continue
+                                        params = dict(strategy["params"])
+                                        params.update(
+                                            {
+                                                "min_score_threshold": min_score_threshold,
+                                                "shanliu_min_score_threshold": min_score_threshold,
+                                                "shanliu_volume_spike_multiplier": volume_spike_multiplier,
+                                                "shanliu_amount_ratio_min": amount_ratio_min,
+                                                "shanliu_market_score_floor": market_score_floor,
+                                                "shanliu_theme_required_score_delta": theme_required_score_delta,
+                                                "preferred_setup_type": "shanliu",
+                                            }
+                                        )
+                                        payload = build_specialized_payload(
+                                            filtered=filtered,
+                                            horizon=horizon,
+                                            params=params,
+                                            market_score_floor=market_score_floor,
+                                        )
+                                        objective = self._to_float((payload.get("metrics") or {}).get("objective"), -10**9)
+                                        if objective > best_score:
+                                            best_score = objective
+                                            best_payload = payload
 
             if best_payload is None:
                 best_payload = {
@@ -4272,7 +4455,7 @@ def _picker_build_action_plan(
         for model_name in configured_models:
             if model_name.startswith("deepseek/"):
                 return model_name
-        return "deepseek/deepseek-chat"
+        return "deepseek/deepseek-v4-pro"
 
     def generate_with_model(
         model_name: str,
@@ -4571,7 +4754,7 @@ def _picker_save_scan_run(
         us_snapshot=us_snapshot,
     )
 
-    with self.db.session_scope() as session:
+    def write_operation(session):
         run = StockSelectionRun(
             query_id=query_id,
             strategy_id=strategy["strategy_id"],
@@ -4621,6 +4804,8 @@ def _picker_save_scan_run(
         session.flush()
         return int(run.id)
 
+    return self._write_with_retry("save_stock_picker_run", write_operation)
+
 
 def _picker_update_run_optimization(
     self: StockPickerService,
@@ -4628,13 +4813,15 @@ def _picker_update_run_optimization(
     run_id: int,
     optimization: Optional[Dict[str, Any]],
 ) -> None:
-    with self.db.session_scope() as session:
+    def write_operation(session):
         run = session.execute(
             select(StockSelectionRun).where(StockSelectionRun.id == run_id)
         ).scalar_one_or_none()
         if run is None:
             return
         run.optimization_snapshot_json = json.dumps(optimization or {}, ensure_ascii=False)
+
+    self._write_with_retry("update_stock_picker_optimization", write_operation)
 
 
 def _picker_load_forward_bars(
@@ -5302,7 +5489,7 @@ def _picker_build_optimization_review(
     ]
     primary_model = str(getattr(self.config, "litellm_model", "") or "")
     model_order: List[str] = []
-    for name in (primary_model, "openai/gpt-5.4", "deepseek/deepseek-reasoner", "deepseek/deepseek-chat", *configured_models):
+    for name in (primary_model, "openai/gpt-5.4", "deepseek/deepseek-v4-pro", *configured_models):
         model_name = str(name or "").strip()
         if model_name and model_name not in model_order:
             model_order.append(model_name)
@@ -5367,7 +5554,7 @@ def _picker_build_optimization_review(
                     f"{response_text}"
                 )
                 repair_models: List[str] = []
-                for repair_name in ("deepseek/deepseek-reasoner", "deepseek/deepseek-chat", "openai/gpt-5.4"):
+                for repair_name in ("deepseek/deepseek-v4-pro", "openai/gpt-5.4"):
                     if repair_name not in repair_models:
                         repair_models.append(repair_name)
                 if model_name not in repair_models:
@@ -5845,6 +6032,7 @@ def _picker_build_weekly_optimization_markdown(
     strategies = payload.get("strategies") or []
     generated_at = str(payload.get("generated_at") or datetime.now().isoformat())
     completed = [item for item in strategies if str(item.get("status") or "").lower() == "completed"]
+    incomplete = [item for item in strategies if str(item.get("status") or "").lower() != "completed"]
     completed.sort(
         key=lambda item: (
             self._to_float((item.get("metrics") or {}).get("objective"), -9999.0),
@@ -5857,15 +6045,14 @@ def _picker_build_weekly_optimization_markdown(
         "",
         f"- 生成时间：{generated_at[:19].replace('T', ' ')}",
         f"- 回测补算：processed {int(self._to_float(backtest_stats.get('processed'), 0.0))} / completed {int(self._to_float(backtest_stats.get('completed'), 0.0))} / pending {int(self._to_float(backtest_stats.get('pending'), 0.0))} / errors {int(self._to_float(backtest_stats.get('errors'), 0.0))}",
-        f"- 完成优化策略数：{len(completed)} / {len(strategies)}",
+        f"- 完成优化策略数：{len(completed)} / {len(strategies)}（已尝试 {len(strategies)} 个策略周期）",
         "",
         "## 策略概览",
         "",
     ]
 
     if not completed:
-        lines.extend(["- 本周没有形成可用的策略优化结果。"])
-        return "\n".join(lines).strip()
+        lines.extend(["- 本周没有形成可用的策略优化结果。", ""])
 
     for item in completed:
         metrics = item.get("metrics") or {}
@@ -5875,12 +6062,33 @@ def _picker_build_weekly_optimization_markdown(
         factors = llm_review.get("factor_hypotheses") or []
         experiments = llm_review.get("next_week_experiments") or []
         control_rules = llm_review.get("control_rules") or []
+        strategy_id = str(item.get("strategy_id") or "")
+        if strategy_id == "main_force_breakout":
+            key_thresholds = (
+                f"score >= {params.get('main_force_min_score_threshold', params.get('min_score_threshold', '-'))}, "
+                f"MA20回踩偏离 <= {params.get('main_force_pullback_max_ma20_distance_pct', '-')}, "
+                f"市场分 >= {params.get('main_force_market_score_floor', '-')}"
+            )
+        elif strategy_id == "shanliu_theme_flow":
+            key_thresholds = (
+                f"score >= {params.get('shanliu_min_score_threshold', params.get('min_score_threshold', '-'))}, "
+                f"量能 >= {params.get('shanliu_volume_spike_multiplier', '-')}, "
+                f"成交额比 >= {params.get('shanliu_amount_ratio_min', '-')}, "
+                f"题材分增量 >= {params.get('shanliu_theme_required_score_delta', '-')}"
+            )
+        else:
+            key_thresholds = (
+                f"score >= {params.get('min_score_threshold', '-')}, "
+                f"volume >= {params.get('volume_spike_multiplier', '-')}, "
+                f"MA20偏离 <= {params.get('max_ma20_distance_pct', '-')}, "
+                f"市场分 >= {params.get('market_score_floor', '-')}"
+            )
         lines.extend(
             [
                 f"### {item.get('strategy_name') or item.get('strategy_id')}",
                 f"- 周期：T+{int(self._to_float(item.get('selected_horizon_days'), 5.0))}",
                 f"- 样本：{int(self._to_float(metrics.get('sample_count'), 0.0))}，胜率：{self._to_float(metrics.get('win_rate_pct'), 0.0):.2f}% ，平均收益：{self._to_float(metrics.get('avg_return_pct'), 0.0):.2f}% ，平均回撤：{self._to_float(metrics.get('avg_max_drawdown_pct'), 0.0):.2f}% ，最差回撤：{self._to_float(metrics.get('worst_drawdown_pct'), 0.0):.2f}%",
-                f"- 关键阈值：score >= {params.get('min_score_threshold', '-')}, volume >= {params.get('volume_spike_multiplier', '-')}, MA20偏离 <= {params.get('max_ma20_distance_pct', '-')}, 市场分 >= {params.get('market_score_floor', '-')}",
+                f"- 关键阈值：{key_thresholds}",
             ]
         )
         diagnosis_summary = str(llm_review.get("diagnosis_summary") or metrics.get("llm_summary") or "").strip()
@@ -5909,6 +6117,23 @@ def _picker_build_weekly_optimization_markdown(
                     f"  - {row.get('experiment') or '-'}；成功标准：{row.get('success_metric') or ''}；停止条件：{row.get('stop_condition') or ''}"
                 )
         lines.extend(["", "---", ""])
+
+    if incomplete:
+        lines.extend(["## 未形成有效优化", ""])
+        for item in incomplete:
+            metrics = item.get("metrics") or {}
+            status = str(item.get("status") or "unknown")
+            sample_count = int(self._to_float(metrics.get("sample_count"), 0.0))
+            reason = str(metrics.get("error") or "").strip()
+            if status == "insufficient_data" and sample_count > 0:
+                reason = "已有样本，但当前参数网格未形成满足最小样本数的有效组合"
+            elif status == "insufficient_data":
+                reason = "近 90 日缺少已完成回测样本"
+            elif not reason:
+                reason = "未返回可用优化结果"
+            lines.append(
+                f"- {item.get('strategy_name') or item.get('strategy_id')} T+{int(self._to_float(item.get('selected_horizon_days'), 5.0))}：{status}，样本 {sample_count}，{reason}"
+            )
 
     return "\n".join(lines).strip()
 
